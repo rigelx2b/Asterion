@@ -8,6 +8,7 @@
 # Secrets
 .env
 .env.*
+!.env.example
 
 # Market data: raw API caches and curated Parquet (provenance is tracked in docs/)
 /data/

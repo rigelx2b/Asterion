@@ -6,6 +6,16 @@
     "commit-commands@claude-plugins-official": true,
     "context7@claude-plugins-official": true
   },
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Edit(./.env)",
+      "Bash(cat .env*)",
+      "Bash(type .env*)",
+      "Bash(Get-Content .env*)"
+    ]
+  },
   "hooks": {
     "PostToolUse": [
       {
