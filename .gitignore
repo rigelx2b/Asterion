@@ -1,0 +1,15 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Claude Code personal/local settings (shared settings stay in .claude/settings.json)
+.claude/settings.local.json
+
+# Secrets
+.env
+.env.*
+
+# Large or generated research artifacts (track provenance, not raw dumps)
+/data/raw/
+/checkpoints/
+*.parquet.tmp
