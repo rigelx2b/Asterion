@@ -1,0 +1,12 @@
+[package]
+name = "asterion-data"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+asterion-core = { version = "0.1.0", path = "../asterion-core" }
+
+[lints]
+workspace = true

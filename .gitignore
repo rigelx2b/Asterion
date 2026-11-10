@@ -9,7 +9,7 @@
 .env
 .env.*
 
-# Large or generated research artifacts (track provenance, not raw dumps)
-/data/raw/
+# Market data: raw API caches and curated Parquet (provenance is tracked in docs/)
+/data/
 /checkpoints/
 *.parquet.tmp
