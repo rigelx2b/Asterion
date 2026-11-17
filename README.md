@@ -10,14 +10,14 @@ Asterion은 한국 주식(KOSPI/KOSDAQ)의 미래 가격 및 수익률을 1, 3, 
 
 ---
 
-## 2. 현재 진행 상황 요약 (2026-11-17 기준)
+## 2. 현재 진행 상황 요약 (2026-11-18 기준)
 
 - **목표 달성 여부**: 미달. 저장된 동결(frozen) 모델의 held-out test 기준 `directional accuracy`는 `h1` 51.3%~`h10` 57.4% 수준이며, `balanced accuracy`는 전 지평에서 약 50~51%로 클래스 불균형의 영향이 크다.
 - **데이터 수집**:
   - **완료**: data.go.kr 일별 시세(2020-01-01..2026-11-13), 지수, FRED 거시 지표, OpenDART 공시, KIS 종목별 투자자 수급, KIS 해외 일봉.
   - **진행 중(재개 가능, 재실행 시 누락 구간만 수집)**:
-    - KIS 과거 일봉(2010-01-01..2020-06-30, 2,812개 종목 대상): 약 `514 / 2,812` 종목 완료.
-    - OpenDART 재무제표: 약 `62,390 / 79,800` 요청 완료(일일 20,000건 호출 한도로 인해 여러 날에 걸쳐 진행 중).
+    - KIS 과거 일봉(2010-01-01..2020-06-30, 2,812개 종목 대상): 약 `1,062 / 2,812` 종목 완료.
+    - OpenDART 재무제표: 약 `78,519 / 79,800` 요청 완료 — 거의 완료(일일 20,000건 호출 한도로 인해 여러 날에 걸쳐 진행 중).
   - **구현 완료 / 백필 대기**: Reddit 수집기(`fetch-reddit`) 및 일별 집계(`reddit-daily`) 구현 완료. Arctic Shift API 속도 제한으로 전체 과거 이력은 향후 덤프 파일 적재 예정.
 - **검증 체계**: `rank-fit`으로 4개 랭킹 모델 arm을 동결 및 paper hypothesis로 등록했으며, `rank-record` / `rank-score` 기반 write-once forward paper ledger로 표본 외(out-of-sample) 검증을 진행 중이다.
 
@@ -71,6 +71,7 @@ Asterion은 한국 주식(KOSPI/KOSDAQ)의 미래 가격 및 수익률을 1, 3, 
 - `config/reddit/subreddits.txt`: 수집 대상 서브레딧 목록.
 - `scripts/`:
   - `daily.sh`: 일간 시세 수집 + 투자자 수급 수집 + `rank-record`
+  - `resume-collect.sh`: 메모리 부족으로 중단된 수집 작업 재개(`delay_secs` 대기 후 여유 물리 메모리가 `min_free_mb`(기본 2048 MB, 30초마다 재확인) 이상이 될 때까지 기다렸다가 `fetch-history`(`kr-union` 유니버스) 또는 `fetch-financials`를 재개하며, `data/logs/<job>-resume-<date>.log`에 로그 기록)
   - `collect-all.sh`, `expand-universe.sh`, `kis-probe.sh`, `train-full.sh`
 - `docs/`:
   - `superpowers/specs`, `plans`: Reddit 수집기 설계 및 구현 계획
@@ -82,19 +83,20 @@ Asterion은 한국 주식(KOSPI/KOSDAQ)의 미래 가격 및 수익률을 1, 3, 
 
 ### 데이터 소스 및 현황
 
-| 소스 | 대상 데이터 | CLI 명령 | 상태 (2026-11-17) |
+| 소스 | 대상 데이터 | CLI 명령 | 상태 (2026-11-18) |
 | :--- | :--- | :--- | :--- |
 | data.go.kr | KRX 일별 시세 (2020-01-01..2026-11-13) | `fetch` | 완료 |
 | data.go.kr | KOSPI / KOSDAQ / KOSPI200 지수 | `fetch-index` | 완료 |
 | FRED | 미국 시장 및 거시경제 시계열 | `fetch-macro` | 완료 |
 | OpenDART | 공시 목록/내역 | `fetch-disclosures` | 완료 |
-| OpenDART | 재무제표 | `fetch-financials` | 진행 중 (~62,390 / 79,800 요청, 일일 20,000건 제한) |
+| OpenDART | 재무제표 | `fetch-financials` | 진행 중 (~78,519 / 79,800 요청 — 거의 완료, 일일 20,000건 제한) |
 | KIS Open API | 종목별 투자자 수급 (개인/외국인/기관) | `fetch-investors` | 완료 |
 | KIS Open API | 해외 일봉 (`us-core.txt`) | `fetch-overseas` | 완료 |
-| KIS Open API | 과거 일봉 (2010-01-01..2020-06-30, 2,812종목) | `fetch-history` | 진행 중 (~514 / 2,812 종목) |
+| KIS Open API | 과거 일봉 (2010-01-01..2020-06-30, 2,812종목) | `fetch-history` | 진행 중 (~1,062 / 2,812 종목) |
 | Arctic Shift (Reddit) | 서브레딧 게시물 및 일별 집계 | `fetch-reddit`, `reddit-daily` | 수집기 구현 완료, 과거 백필은 덤프 적재 예정 |
 
 - 모든 `fetch*` 명령은 중단 후 재실행 시 누락 구간만 이어서 수집하며(resumable), 진행 상태를 `data/status`에 기록한다.
+- 장시간 소요되는 수집 작업은 백그라운드로 실행하며, 메모리 부족으로 중단된 경우 `resume-collect.sh`로 재개하고 진행 상황은 모니터링 대시보드(`http://127.0.0.1:8787`)에서 확인할 수 있다.
 - 원시 데이터는 `data/raw/` 하위에 저장되며, Git 저장소에 커밋하지 않는다.
 
 ### Reddit 수집기 세부 사항
@@ -176,6 +178,9 @@ asterion fetch-history --universe config/universe/kr-union.txt
 # OpenDART 재무제표 수집
 asterion fetch-financials
 
+# 메모리 부족으로 중단된 수집 재개 (delay_secs 대기 후 여유 메모리 >= min_free_mb(기본 2048 MB, 30초마다 재확인) 시 실행, data/logs/<job>-resume-<date>.log 기록)
+bash scripts/resume-collect.sh <history|financials> [delay_secs] [min_free_mb]
+
 # Reddit 게시물 수집 (Arctic Shift)
 asterion fetch-reddit --from 2024-01-01
 
@@ -187,7 +192,7 @@ asterion monitor
 
 ## 7. 다음 할 일
 
-1. KIS 과거 일봉(2010-01-01..2020-06-30) 및 OpenDART 재무제표 수집 완료.
+1. OpenDART 재무제표 수집 완료(거의 완료 상태) 및 KIS 과거 일봉(2010-01-01..2020-06-30) 수집 지속.
 2. 저장 공간 확보 후 Arctic Shift 덤프 파일을 통한 Reddit 과거 이력 적재(최근 일자는 기존 API 유지).
 3. 2010–2020 KIS 과거 일봉과 OpenDART 재무제표를 피처에 반영하고 purged walk-forward CV 재실행.
 4. Forward paper ledger 채점을 지속하며, 비용 차감 후 표본 외에서 유의미한 성능이 확인될 때만 우위(edge)를 인정.
