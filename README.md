@@ -14,10 +14,9 @@ Asterion은 한국 주식(KOSPI/KOSDAQ)의 미래 가격 및 수익률을 1, 3, 
 
 - **목표 달성 여부**: 미달. 저장된 동결(frozen) 모델의 held-out test 기준 `directional accuracy`는 `h1` 51.3%~`h10` 57.4% 수준이며, `balanced accuracy`는 전 지평에서 약 50~51%로 클래스 불균형의 영향이 크다.
 - **데이터 수집**:
-  - **완료**: data.go.kr 일별 시세(2020-01-01..2026-11-13), 지수, FRED 거시 지표, OpenDART 공시, KIS 종목별 투자자 수급, KIS 해외 일봉.
+  - **완료**: data.go.kr 일별 시세(2020-01-01..2026-11-13), 지수, FRED 거시 지표, OpenDART 공시, OpenDART 재무제표(`79,800 / 79,800` 요청, 실패 0건, 2026-11-18 01:38 KST 완료), KIS 종목별 투자자 수급, KIS 해외 일봉.
   - **진행 중(재개 가능, 재실행 시 누락 구간만 수집)**:
-    - KIS 과거 일봉(2010-01-01..2020-06-30, 2,812개 종목 대상): 약 `1,062 / 2,812` 종목 완료.
-    - OpenDART 재무제표: 약 `78,519 / 79,800` 요청 완료 — 거의 완료(일일 20,000건 호출 한도로 인해 여러 날에 걸쳐 진행 중).
+    - KIS 과거 일봉(2010-01-01..2020-06-30, 2,812개 종목 대상): 약 `1,114 / 2,812` 종목 완료.
   - **구현 완료 / 백필 대기**: Reddit 수집기(`fetch-reddit`) 및 일별 집계(`reddit-daily`) 구현 완료. Arctic Shift API 속도 제한으로 전체 과거 이력은 향후 덤프 파일 적재 예정.
 - **검증 체계**: `rank-fit`으로 4개 랭킹 모델 arm을 동결 및 paper hypothesis로 등록했으며, `rank-record` / `rank-score` 기반 write-once forward paper ledger로 표본 외(out-of-sample) 검증을 진행 중이다.
 
@@ -89,10 +88,10 @@ Asterion은 한국 주식(KOSPI/KOSDAQ)의 미래 가격 및 수익률을 1, 3, 
 | data.go.kr | KOSPI / KOSDAQ / KOSPI200 지수 | `fetch-index` | 완료 |
 | FRED | 미국 시장 및 거시경제 시계열 | `fetch-macro` | 완료 |
 | OpenDART | 공시 목록/내역 | `fetch-disclosures` | 완료 |
-| OpenDART | 재무제표 | `fetch-financials` | 진행 중 (~78,519 / 79,800 요청 — 거의 완료, 일일 20,000건 제한) |
+| OpenDART | 재무제표 | `fetch-financials` | 완료 (79,800 / 79,800 요청, 실패 0건, 2026-11-18 01:38 KST) |
 | KIS Open API | 종목별 투자자 수급 (개인/외국인/기관) | `fetch-investors` | 완료 |
 | KIS Open API | 해외 일봉 (`us-core.txt`) | `fetch-overseas` | 완료 |
-| KIS Open API | 과거 일봉 (2010-01-01..2020-06-30, 2,812종목) | `fetch-history` | 진행 중 (~1,062 / 2,812 종목) |
+| KIS Open API | 과거 일봉 (2010-01-01..2020-06-30, 2,812종목) | `fetch-history` | 진행 중 (~1,114 / 2,812 종목) |
 | Arctic Shift (Reddit) | 서브레딧 게시물 및 일별 집계 | `fetch-reddit`, `reddit-daily` | 수집기 구현 완료, 과거 백필은 덤프 적재 예정 |
 
 - 모든 `fetch*` 명령은 중단 후 재실행 시 누락 구간만 이어서 수집하며(resumable), 진행 상태를 `data/status`에 기록한다.
@@ -192,7 +191,7 @@ asterion monitor
 
 ## 7. 다음 할 일
 
-1. OpenDART 재무제표 수집 완료(거의 완료 상태) 및 KIS 과거 일봉(2010-01-01..2020-06-30) 수집 지속.
+1. KIS 과거 일봉(2010-01-01..2020-06-30) 수집 지속 (OpenDART 재무제표 수집 완료).
 2. 저장 공간 확보 후 Arctic Shift 덤프 파일을 통한 Reddit 과거 이력 적재(최근 일자는 기존 API 유지).
 3. 2010–2020 KIS 과거 일봉과 OpenDART 재무제표를 피처에 반영하고 purged walk-forward CV 재실행.
 4. Forward paper ledger 채점을 지속하며, 비용 차감 후 표본 외에서 유의미한 성능이 확인될 때만 우위(edge)를 인정.
