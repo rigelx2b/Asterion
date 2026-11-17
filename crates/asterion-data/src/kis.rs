@@ -1,0 +1,759 @@
+//! Korea Investment & Securities (KIS) Open API: per-stock daily net buying by investor
+//! type (individual, foreign, institution). The endpoint returns only a recent window
+//! with no start-date parameter, so history is built by fetching every day.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use std::{env, fmt, fs};
+
+use chrono::{FixedOffset, NaiveDate, Timelike, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::error::DataError;
+use crate::http::{Http, RetryPolicy};
+use crate::redact::{MASK, redact_secret};
+
+pub const SOURCE_ID: &str = "kis_investor";
+pub const BASE_URL: &str = "https://openapi.koreainvestment.com:9443";
+pub const DEFAULT_ROOT: &str = "data/raw/kis_investor";
+const TOKEN_PATH: &str = "/oauth2/tokenP";
+const INVESTOR_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-investor";
+const INVESTOR_TR_ID: &str = "FHKST01010900";
+// Real accounts allow 20 requests per second; stay below it.
+pub const MIN_INTERVAL: Duration = Duration::from_millis(70);
+// Same-day figures are final only after the close; before this KST hour today's row is dropped.
+const FINAL_HOUR_KST: u32 = 18;
+const RATE_LIMIT_CODE: &str = "EGW00201";
+const CHART_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice";
+const CHART_TR_ID: &str = "FHKST03010100";
+pub const HISTORY_ROOT: &str = "data/raw/kis_daily";
+const OVERSEAS_PATH: &str = "/uapi/overseas-price/v1/quotations/dailyprice";
+const OVERSEAS_TR_ID: &str = "HHDFS76240000";
+pub const OVERSEAS_ROOT: &str = "data/raw/kis_overseas";
+// Calendar days per chart request; about 95 sessions, under the 100-row page limit.
+const HISTORY_WINDOW_DAYS: u64 = 140;
+
+/// App key and secret. `Debug` never prints either value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KisKeys {
+    app_key: String,
+    app_secret: String,
+}
+
+impl KisKeys {
+    pub const KEY_VAR: &'static str = "KIS_APP_KEY";
+    pub const SECRET_VAR: &'static str = "KIS_APP_SECRET";
+
+    pub fn new(app_key: &str, app_secret: &str) -> Self {
+        KisKeys {
+            app_key: app_key.trim().to_owned(),
+            app_secret: app_secret.trim().to_owned(),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, DataError> {
+        let read = |name: &'static str| match env::var(name) {
+            Ok(v) if !v.trim().is_empty() => Ok(v),
+            _ => Err(DataError::MissingServiceKey(name)),
+        };
+        Ok(Self::new(&read(Self::KEY_VAR)?, &read(Self::SECRET_VAR)?))
+    }
+}
+
+impl fmt::Debug for KisKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KisKeys")
+            .field("app_key", &MASK)
+            .field("app_secret", &MASK)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: Option<String>,
+    error_code: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartEnvelope {
+    rt_cd: String,
+    #[serde(default)]
+    msg_cd: String,
+    #[serde(default)]
+    msg1: String,
+    #[serde(default)]
+    output2: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Envelope {
+    rt_cd: String,
+    #[serde(default)]
+    msg_cd: String,
+    #[serde(default)]
+    msg1: String,
+    #[serde(default)]
+    output: Vec<serde_json::Value>,
+}
+
+pub struct KisClient {
+    http: Http,
+    keys: KisKeys,
+    base: String,
+    token: Option<String>,
+}
+
+impl fmt::Debug for KisClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KisClient")
+            .field("http", &self.http)
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
+}
+
+impl KisClient {
+    pub fn new(keys: KisKeys, base: &str, policy: RetryPolicy) -> Result<Self, DataError> {
+        // Errors are scrubbed of the secret; the app key travels in headers only.
+        let http = Http::new(&keys.app_secret, policy)?;
+        Ok(KisClient {
+            http,
+            keys,
+            base: base.trim_end_matches('/').to_owned(),
+            token: None,
+        })
+    }
+
+    pub fn requests_sent(&self) -> u32 {
+        self.http.requests_sent()
+    }
+
+    fn scrub(&self, text: &str) -> String {
+        let text = redact_secret(text, &self.keys.app_secret);
+        let text = redact_secret(&text, &self.keys.app_key);
+        match &self.token {
+            Some(t) => redact_secret(&text, t),
+            None => text,
+        }
+    }
+
+    // One token per run; KIS limits how often tokens may be issued.
+    async fn token(&mut self) -> Result<String, DataError> {
+        if let Some(t) = &self.token {
+            return Ok(t.clone());
+        }
+        let url = format!("{}{TOKEN_PATH}", self.base);
+        let body = serde_json::json!({
+            "grant_type": "client_credentials",
+            "appkey": self.keys.app_key,
+            "appsecret": self.keys.app_secret,
+        });
+        let body = body.to_string();
+        let text = self
+            .http
+            .send(|c| {
+                c.post(&url)
+                    .header("content-type", "application/json; charset=utf-8")
+                    .body(body.clone())
+            })
+            .await?;
+        let parsed: TokenResponse = serde_json::from_str(&text)?;
+        match parsed.access_token {
+            Some(t) if !t.is_empty() => {
+                self.token = Some(t.clone());
+                Ok(t)
+            }
+            _ => Err(DataError::Api {
+                code: parsed.error_code.unwrap_or_default(),
+                message: self.scrub(&parsed.error_description.unwrap_or_default()),
+            }),
+        }
+    }
+
+    /// Raw JSON body of the investor breakdown for one KRX short code.
+    pub async fn fetch_investor(&mut self, code: &str) -> Result<String, DataError> {
+        let token = self.token().await?;
+        let url = format!("{}{INVESTOR_PATH}", self.base);
+        let auth = format!("Bearer {token}");
+        for attempt in 0..3 {
+            let text = self
+                .http
+                .send(|c| {
+                    c.get(&url)
+                        .query(&[("FID_COND_MRKT_DIV_CODE", "J"), ("FID_INPUT_ISCD", code)])
+                        .header("content-type", "application/json; charset=utf-8")
+                        .header("authorization", &auth)
+                        .header("appkey", &self.keys.app_key)
+                        .header("appsecret", &self.keys.app_secret)
+                        .header("tr_id", INVESTOR_TR_ID)
+                        .header("custtype", "P")
+                })
+                .await?;
+            let env: Envelope = serde_json::from_str(&text)?;
+            if env.rt_cd == "0" {
+                return Ok(text);
+            }
+            if env.msg_cd == RATE_LIMIT_CODE && attempt < 2 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            return Err(DataError::Api {
+                code: env.msg_cd,
+                message: self.scrub(&env.msg1),
+            });
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    /// Raw JSON body of daily bars for one code between two dates, inclusive.
+    /// `adjusted` is passed through as FID_ORG_ADJ_PRC.
+    pub async fn fetch_chart(
+        &mut self,
+        code: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+        adjusted: &str,
+    ) -> Result<String, DataError> {
+        let token = self.token().await?;
+        let url = format!("{}{CHART_PATH}", self.base);
+        let auth = format!("Bearer {token}");
+        let d1 = from.format("%Y%m%d").to_string();
+        let d2 = to.format("%Y%m%d").to_string();
+        for attempt in 0..3 {
+            let text = self
+                .http
+                .send(|c| {
+                    c.get(&url)
+                        .query(&[
+                            ("FID_COND_MRKT_DIV_CODE", "J"),
+                            ("FID_INPUT_ISCD", code),
+                            ("FID_INPUT_DATE_1", d1.as_str()),
+                            ("FID_INPUT_DATE_2", d2.as_str()),
+                            ("FID_PERIOD_DIV_CODE", "D"),
+                            ("FID_ORG_ADJ_PRC", adjusted),
+                        ])
+                        .header("content-type", "application/json; charset=utf-8")
+                        .header("authorization", &auth)
+                        .header("appkey", &self.keys.app_key)
+                        .header("appsecret", &self.keys.app_secret)
+                        .header("tr_id", CHART_TR_ID)
+                        .header("custtype", "P")
+                })
+                .await?;
+            let env: ChartEnvelope = serde_json::from_str(&text)?;
+            if env.rt_cd == "0" {
+                return Ok(text);
+            }
+            if env.msg_cd == RATE_LIMIT_CODE && attempt < 2 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            return Err(DataError::Api {
+                code: env.msg_cd,
+                message: self.scrub(&env.msg1),
+            });
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+}
+
+impl KisClient {
+    /// Raw JSON body of up to 100 daily bars ending at `base` for one overseas listing.
+    /// `exchange` is a KIS code such as NAS, NYS or AMS; `adjusted` is MODP ("0" or "1").
+    pub async fn fetch_overseas(
+        &mut self,
+        exchange: &str,
+        symbol: &str,
+        base: NaiveDate,
+        adjusted: &str,
+    ) -> Result<String, DataError> {
+        let token = self.token().await?;
+        let url = format!("{}{OVERSEAS_PATH}", self.base);
+        let auth = format!("Bearer {token}");
+        let bymd = base.format("%Y%m%d").to_string();
+        for attempt in 0..3 {
+            let text = self
+                .http
+                .send(|c| {
+                    c.get(&url)
+                        .query(&[
+                            ("AUTH", ""),
+                            ("EXCD", exchange),
+                            ("SYMB", symbol),
+                            ("GUBN", "0"),
+                            ("BYMD", bymd.as_str()),
+                            ("MODP", adjusted),
+                        ])
+                        .header("content-type", "application/json; charset=utf-8")
+                        .header("authorization", &auth)
+                        .header("appkey", &self.keys.app_key)
+                        .header("appsecret", &self.keys.app_secret)
+                        .header("tr_id", OVERSEAS_TR_ID)
+                        .header("custtype", "P")
+                })
+                .await?;
+            let env: ChartEnvelope = serde_json::from_str(&text)?;
+            if env.rt_cd == "0" {
+                return Ok(text);
+            }
+            if env.msg_cd == RATE_LIMIT_CODE && attempt < 2 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            return Err(DataError::Api {
+                code: env.msg_cd,
+                message: self.scrub(&env.msg1),
+            });
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+}
+
+/// Daily bars from the overseas endpoint; prices in the listing's currency.
+pub fn parse_overseas(body: &str) -> Result<Vec<ChartBar>, DataError> {
+    let env: ChartEnvelope = serde_json::from_str(body)?;
+    let mut out = Vec::new();
+    for row in &env.output2 {
+        let raw_date = row.get("xymd").and_then(|v| v.as_str()).unwrap_or("");
+        if raw_date.is_empty() {
+            continue;
+        }
+        let date =
+            NaiveDate::parse_from_str(raw_date, "%Y%m%d").map_err(|_| DataError::InvalidField {
+                field: "xymd",
+                value: raw_date.to_owned(),
+            })?;
+        let close = number(row, "clos")?;
+        if close <= 0.0 {
+            continue;
+        }
+        out.push(ChartBar {
+            date,
+            open: number(row, "open")?,
+            high: number(row, "high")?,
+            low: number(row, "low")?,
+            close,
+            volume: number(row, "tvol")?,
+            trading_value: number(row, "tamt")?,
+        });
+    }
+    out.sort_by_key(|b| b.date);
+    out.dedup_by_key(|b| b.date);
+    Ok(out)
+}
+
+/// Pages back from `to` (each page ends the day before the previous page's first bar)
+/// until `from` or an empty page. Bodies live at `<root>/<EXCD>_<SYMB>/<adjusted>/<base>.json`;
+/// pages dated before `to` are reused. Returns (new requests, rows seen).
+pub async fn collect_overseas(
+    client: &mut KisClient,
+    root: &Path,
+    exchange: &str,
+    symbol: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+    adjusted: &str,
+) -> Result<(usize, usize), DataError> {
+    let dir = root.join(format!("{exchange}_{symbol}")).join(adjusted);
+    let (mut requests, mut rows) = (0, 0);
+    let mut base = to;
+    loop {
+        let path = dir.join(format!("{base}.json"));
+        // The newest page is always refetched so a rerun picks up new sessions.
+        let body = if path.exists() && base < to {
+            fs::read_to_string(&path).map_err(|e| io(&path, e))?
+        } else {
+            let body = client
+                .fetch_overseas(exchange, symbol, base, adjusted)
+                .await?;
+            requests += 1;
+            fs::create_dir_all(&dir).map_err(|e| io(&dir, e))?;
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, &body).map_err(|e| io(&tmp, e))?;
+            fs::rename(&tmp, &path).map_err(|e| io(&path, e))?;
+            body
+        };
+        let bars = parse_overseas(&body)?;
+        rows += bars.len();
+        let Some(first) = bars.first() else { break };
+        if first.date <= from {
+            break;
+        }
+        let Some(next) = first.date.pred_opt() else {
+            break;
+        };
+        if next >= base {
+            break;
+        }
+        base = next;
+    }
+    Ok((requests, rows))
+}
+
+/// Every cached overseas bar for one listing, sorted, one per date.
+pub fn load_overseas(
+    root: &Path,
+    exchange: &str,
+    symbol: &str,
+    adjusted: &str,
+) -> Result<Vec<ChartBar>, DataError> {
+    let dir = root.join(format!("{exchange}_{symbol}")).join(adjusted);
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in read {
+        let path = item.map_err(|e| io(&dir, e))?.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            let text = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+            out.extend(parse_overseas(&text)?);
+        }
+    }
+    out.sort_by_key(|b| b.date);
+    out.dedup_by_key(|b| b.date);
+    Ok(out)
+}
+
+/// One daily bar from the chart endpoint, prices as the request's adjustment flag gave them.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ChartBar {
+    pub date: NaiveDate,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub trading_value: f64,
+}
+
+pub fn parse_chart(body: &str) -> Result<Vec<ChartBar>, DataError> {
+    let env: ChartEnvelope = serde_json::from_str(body)?;
+    let mut out = Vec::new();
+    for row in &env.output2 {
+        let raw_date = row
+            .get("stck_bsop_date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if raw_date.is_empty() {
+            continue;
+        }
+        let date =
+            NaiveDate::parse_from_str(raw_date, "%Y%m%d").map_err(|_| DataError::InvalidField {
+                field: "stck_bsop_date",
+                value: raw_date.to_owned(),
+            })?;
+        out.push(ChartBar {
+            date,
+            open: number(row, "stck_oprc")?,
+            high: number(row, "stck_hgpr")?,
+            low: number(row, "stck_lwpr")?,
+            close: number(row, "stck_clpr")?,
+            volume: number(row, "acml_vol")?,
+            trading_value: number(row, "acml_tr_pbmn")?,
+        });
+    }
+    out.sort_by_key(|b| b.date);
+    out.dedup_by_key(|b| b.date);
+    Ok(out)
+}
+
+/// Raw chart bodies live at `<root>/<code>/<adjusted>/<from>_<to>.json`.
+pub fn chart_path(
+    root: &Path,
+    code: &str,
+    adjusted: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> PathBuf {
+    root.join(code)
+        .join(adjusted)
+        .join(format!("{from}_{to}.json"))
+}
+
+/// Walks back from `to` in fixed windows, storing each body once, until `from` or the
+/// first empty window (before listing). Returns (new requests, total rows seen).
+pub async fn collect_history(
+    client: &mut KisClient,
+    root: &Path,
+    code: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+    adjusted: &str,
+) -> Result<(usize, usize), DataError> {
+    let (mut requests, mut rows) = (0, 0);
+    let mut end = to;
+    while end >= from {
+        let start = end
+            .checked_sub_days(chrono::Days::new(HISTORY_WINDOW_DAYS - 1))
+            .map_or(from, |d| d.max(from));
+        let path = chart_path(root, code, adjusted, start, end);
+        let body = if path.exists() {
+            fs::read_to_string(&path).map_err(|e| io(&path, e))?
+        } else {
+            let body = client.fetch_chart(code, start, end, adjusted).await?;
+            requests += 1;
+            let dir = path.parent().expect("chart path has a parent");
+            fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, &body).map_err(|e| io(&tmp, e))?;
+            fs::rename(&tmp, &path).map_err(|e| io(&path, e))?;
+            body
+        };
+        let n = parse_chart(&body)?.len();
+        rows += n;
+        if n == 0 {
+            break;
+        }
+        let Some(next) = start.pred_opt() else { break };
+        end = next;
+    }
+    Ok((requests, rows))
+}
+
+/// Every cached bar for `code` under one adjustment flag, sorted, one per date.
+pub fn load_history(root: &Path, code: &str, adjusted: &str) -> Result<Vec<ChartBar>, DataError> {
+    let dir = root.join(code).join(adjusted);
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in read {
+        let path = item.map_err(|e| io(&dir, e))?.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            let text = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+            out.extend(parse_chart(&text)?);
+        }
+    }
+    out.sort_by_key(|b| b.date);
+    out.dedup_by_key(|b| b.date);
+    Ok(out)
+}
+
+/// One session of investor-type flows. Values are as the API reports them
+/// (shares for `*_qty`, the API's KRW unit for `*_value`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InvestorFlow {
+    pub date: NaiveDate,
+    pub close: f64,
+    pub individual_net_qty: f64,
+    pub foreign_net_qty: f64,
+    pub institution_net_qty: f64,
+    pub individual_net_value: f64,
+    pub foreign_net_value: f64,
+    pub institution_net_value: f64,
+}
+
+fn number(row: &serde_json::Value, field: &'static str) -> Result<f64, DataError> {
+    let raw = row.get(field).and_then(|v| v.as_str()).unwrap_or("");
+    if raw.trim().is_empty() {
+        return Ok(0.0);
+    }
+    raw.trim()
+        .parse::<f64>()
+        .map_err(|_| DataError::InvalidField {
+            field,
+            value: raw.to_owned(),
+        })
+}
+
+pub fn parse_investor(body: &str) -> Result<Vec<InvestorFlow>, DataError> {
+    let env: Envelope = serde_json::from_str(body)?;
+    let mut out = Vec::new();
+    for row in &env.output {
+        let raw_date = row
+            .get("stck_bsop_date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if raw_date.is_empty() {
+            continue;
+        }
+        let date =
+            NaiveDate::parse_from_str(raw_date, "%Y%m%d").map_err(|_| DataError::InvalidField {
+                field: "stck_bsop_date",
+                value: raw_date.to_owned(),
+            })?;
+        out.push(InvestorFlow {
+            date,
+            close: number(row, "stck_clpr")?,
+            individual_net_qty: number(row, "prsn_ntby_qty")?,
+            foreign_net_qty: number(row, "frgn_ntby_qty")?,
+            institution_net_qty: number(row, "orgn_ntby_qty")?,
+            individual_net_value: number(row, "prsn_ntby_tr_pbmn")?,
+            foreign_net_value: number(row, "frgn_ntby_tr_pbmn")?,
+            institution_net_value: number(row, "orgn_ntby_tr_pbmn")?,
+        });
+    }
+    out.sort_by_key(|f| f.date);
+    Ok(out)
+}
+
+fn io(path: &Path, source: std::io::Error) -> DataError {
+    DataError::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+fn kst_now() -> chrono::DateTime<FixedOffset> {
+    Utc::now().with_timezone(&FixedOffset::east_opt(9 * 3600).expect("valid offset"))
+}
+
+/// Raw bodies live at `<root>/<code>/<fetch date>.json`, one per day.
+pub fn body_path(root: &Path, code: &str, fetched: NaiveDate) -> PathBuf {
+    root.join(code).join(format!("{fetched}.json"))
+}
+
+pub fn fetched_today(root: &Path, code: &str) -> bool {
+    body_path(root, code, kst_now().date_naive()).exists()
+}
+
+/// Fetches one code and stores the raw body unless today's body already exists.
+/// Returns the number of final sessions in the body.
+pub async fn collect_code(
+    client: &mut KisClient,
+    root: &Path,
+    code: &str,
+) -> Result<Option<usize>, DataError> {
+    let now = kst_now();
+    let path = body_path(root, code, now.date_naive());
+    if path.exists() {
+        return Ok(None);
+    }
+    let body = client.fetch_investor(code).await?;
+    let rows = parse_investor(&body)?;
+    let dir = path.parent().expect("body path has a parent");
+    fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &body).map_err(|e| io(&tmp, e))?;
+    fs::rename(&tmp, &path).map_err(|e| io(&path, e))?;
+    let today = now.date_naive();
+    let final_rows = rows
+        .iter()
+        .filter(|r| r.date < today || now.hour() >= FINAL_HOUR_KST)
+        .count();
+    Ok(Some(final_rows))
+}
+
+/// Every final session cached for `code`, newest fetch winning on a date. A row dated on
+/// its own fetch day counts only when fetched after the close.
+pub fn load_flows(root: &Path, code: &str) -> Result<Vec<InvestorFlow>, DataError> {
+    let dir = root.join(code);
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut bodies: Vec<(NaiveDate, PathBuf)> = Vec::new();
+    for item in read {
+        let path = item.map_err(|e| io(&dir, e))?.path();
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+        let Some(Ok(day)) = stem.map(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d")) else {
+            continue;
+        };
+        if path.extension().is_some_and(|e| e == "json") {
+            bodies.push((day, path));
+        }
+    }
+    bodies.sort();
+    let mut by_date = std::collections::BTreeMap::new();
+    for (fetched, path) in bodies {
+        let body = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+        let modified_after_close = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(|t| {
+                chrono::DateTime::<Utc>::from(t)
+                    .with_timezone(&FixedOffset::east_opt(9 * 3600).expect("valid offset"))
+                    .hour()
+                    >= FINAL_HOUR_KST
+            })
+            .unwrap_or(false);
+        for row in parse_investor(&body)? {
+            if row.date < fetched || (row.date == fetched && modified_after_close) {
+                by_date.insert(row.date, row);
+            }
+        }
+    }
+    Ok(by_date.into_values().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BODY: &str = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output":[
+        {"stck_bsop_date":"20261111","stck_clpr":"205900","prsn_ntby_qty":"-1200","frgn_ntby_qty":"900","orgn_ntby_qty":"300","prsn_ntby_tr_pbmn":"-247","frgn_ntby_tr_pbmn":"185","orgn_ntby_tr_pbmn":"62"},
+        {"stck_bsop_date":"20261110","stck_clpr":"204000","prsn_ntby_qty":"","frgn_ntby_qty":"-5","orgn_ntby_qty":"5","prsn_ntby_tr_pbmn":"0","frgn_ntby_tr_pbmn":"-1","orgn_ntby_tr_pbmn":"1"}
+    ]}"#;
+
+    #[test]
+    fn parses_rows_oldest_first_and_blank_as_zero() {
+        let rows = parse_investor(BODY).expect("parses");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].date,
+            NaiveDate::from_ymd_opt(2026, 11, 10).expect("date")
+        );
+        assert_eq!(rows[0].individual_net_qty, 0.0);
+        assert_eq!(rows[1].foreign_net_qty, 900.0);
+        assert_eq!(rows[1].individual_net_value, -247.0);
+    }
+
+    #[test]
+    fn error_envelope_has_no_rows() {
+        let body = r#"{"rt_cd":"1","msg_cd":"EGW00123","msg1":"expired"}"#;
+        assert!(parse_investor(body).expect("parses").is_empty());
+    }
+
+    #[test]
+    fn keys_debug_is_masked() {
+        let k = KisKeys::new("abc", "def");
+        let shown = format!("{k:?}");
+        assert!(!shown.contains("abc") && !shown.contains("def"));
+    }
+
+    #[test]
+    fn load_keeps_only_sessions_before_the_fetch_day() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = body_path(
+            dir.path(),
+            "005930",
+            NaiveDate::from_ymd_opt(2026, 11, 11).expect("date"),
+        );
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, BODY).expect("write");
+        let rows = load_flows(dir.path(), "005930").expect("loads");
+        // The 11-11 row was fetched on 11-11; it stays only if the file was written after 18:00 KST.
+        assert!(
+            rows.iter()
+                .any(|r| r.date == NaiveDate::from_ymd_opt(2026, 11, 10).expect("date"))
+        );
+    }
+
+    #[test]
+    fn chart_body_parses_and_sorts() {
+        let body = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":{},"output2":[
+            {"stck_bsop_date":"20190103","stck_clpr":"100","stck_oprc":"98","stck_hgpr":"101","stck_lwpr":"97","acml_vol":"10","acml_tr_pbmn":"1000"},
+            {"stck_bsop_date":"20190102","stck_clpr":"98","stck_oprc":"99","stck_hgpr":"99","stck_lwpr":"96","acml_vol":"5","acml_tr_pbmn":"490"},
+            {}]}"#;
+        let bars = parse_chart(body).expect("parses");
+        assert_eq!(bars.len(), 2);
+        assert!(bars[0].date < bars[1].date);
+        assert!((bars[1].close - 100.0).abs() < 1e-12);
+        assert!((bars[0].trading_value - 490.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn overseas_body_parses_and_skips_blank_rows() {
+        let body = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":{},"output2":[
+            {"xymd":"20240103","clos":"481.68","open":"490.0","high":"492.1","low":"475.1","tvol":"100","tamt":"48000"},
+            {"xymd":"20240102","clos":"481.68","open":"","high":"","low":"","tvol":"","tamt":""},
+            {"xymd":"","clos":"0"}]}"#;
+        let bars = parse_overseas(body).expect("parses");
+        assert_eq!(bars.len(), 2);
+        assert_eq!(
+            bars[0].date,
+            NaiveDate::from_ymd_opt(2024, 1, 2).expect("date")
+        );
+        assert!((bars[1].close - 481.68).abs() < 1e-9);
+    }
+}

@@ -1,0 +1,51 @@
+# Overseas listings for the KIS overseas collector, one EXCHANGE:SYMBOL per line.
+# Exchange codes are KIS EXCD values (NAS = Nasdaq, NYS = NYSE, AMS = AMEX/Arca).
+# Korea proxies
+AMS:EWY
+# Semiconductors and equipment
+NAS:NVDA
+NAS:AMD
+NAS:MU
+NAS:AVGO
+NYS:TSM
+NAS:INTC
+NAS:QCOM
+NAS:AMAT
+NAS:LRCX
+NAS:KLAC
+NAS:ASML
+NAS:SOXX
+NAS:SMH
+# Large-cap tech and platforms
+NAS:AAPL
+NAS:MSFT
+NAS:GOOGL
+NAS:AMZN
+NAS:META
+NAS:TSLA
+# Autos, batteries and materials
+NYS:GM
+NYS:F
+NYS:ALB
+# Energy, industrials, shipping
+NYS:XOM
+NYS:CVX
+NYS:CAT
+NYS:BA
+# Healthcare and biotech
+NYS:LLY
+AMS:XBI
+# Sector ETFs (SPDR, NYSE Arca)
+AMS:XLK
+AMS:XLE
+AMS:XLF
+AMS:XLV
+AMS:XLI
+AMS:XLB
+AMS:XLY
+AMS:XLP
+AMS:XLU
+# Broad market
+AMS:SPY
+NAS:QQQ
+AMS:IWM

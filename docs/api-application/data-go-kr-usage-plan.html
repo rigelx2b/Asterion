@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>공공데이터 활용계획서 — 금융위원회_주식시세정보</title>
+<style>
+  @page { size: A4; margin: 18mm 17mm; }
+  body { font-family: "Malgun Gothic", "맑은 고딕", sans-serif; font-size: 10pt; line-height: 1.55; color: #111; background: #fff; }
+  h1 { font-size: 17pt; text-align: center; margin: 0 0 4mm; letter-spacing: 1px; }
+  .sub { text-align: center; color: #444; margin-bottom: 6mm; }
+  h2 { font-size: 11.5pt; border-bottom: 1.5px solid #222; padding-bottom: 1mm; margin: 6mm 0 2.5mm; }
+  table { width: 100%; border-collapse: collapse; margin: 1mm 0 2mm; }
+  th, td { border: 1px solid #888; padding: 1.6mm 2.4mm; vertical-align: top; text-align: left; }
+  th { background: #f0f0f0; width: 27%; font-weight: 600; }
+  ul { margin: 1mm 0 1mm 5mm; padding-left: 3mm; }
+  li { margin: 0.6mm 0; }
+  pre { font-family: Consolas, "Courier New", monospace; font-size: 7.9pt; line-height: 1.35; background: #f6f6f6; border: 1px solid #ccc; padding: 2.5mm 3mm; white-space: pre-wrap; margin: 1.5mm 0; }
+  .note { color: #444; font-size: 9pt; }
+  .page-break { break-before: page; }
+</style>
+</head>
+<body>
+
+<h1>공공데이터 활용계획서</h1>
+<div class="sub">금융위원회_주식시세정보 (Open API) 활용신청 첨부자료</div>
+
+<h2>1. 신청 개요</h2>
+<table>
+  <tr><th>신청 API</th><td>금융위원회_주식시세정보 — 상세기능 「주식시세」</td></tr>
+  <tr><th>제공기관</th><td>금융위원회</td></tr>
+  <tr><th>서비스 URL</th><td>https://apis.data.go.kr/1160100/GetStockSecuritiesInfoService_V2</td></tr>
+  <tr><th>활용 형태</th><td>개인 비상업적 연구 (학습·연구용 소프트웨어 개발)</td></tr>
+  <tr><th>프로젝트명</th><td>Asterion — 다중 미래 시점 주가 수익률 예측 연구</td></tr>
+  <tr><th>작성일</th><td>2026년 11월 10일</td></tr>
+</table>
+
+<h2>2. 활용 목적</h2>
+<p>국내 상장주식의 일별 시세를 이용하여, 여러 미래 거래일(1·3·5·10·20거래일 후) 수익률의 방향성과 크기를 예측하는 시계열 모델을 연구합니다. 연구는 Rust 언어로 구현하며, 다음을 검증하는 것이 목적입니다.</p>
+<ul>
+  <li>데이터 정합성 검사(결측·중복·이상치, 거래일 정렬) 방법</li>
+  <li>미래 정보 누수 없이 학습·검증·평가 기간을 시간순으로 분리하는 평가 체계</li>
+  <li>단순 기준 모델과 딥러닝 모델의 예측 성능 비교</li>
+</ul>
+<p>본 연구는 투자 자문, 매매 신호 제공, 유료 서비스 등 상업적 목적에 사용하지 않습니다.</p>
+
+<h2>3. 활용 데이터 및 범위</h2>
+<table>
+  <tr><th>상세기능</th><td>주식시세 (그 외 상세기능은 사용하지 않음)</td></tr>
+  <tr><th>대상 종목</th><td>KOSPI·KOSDAQ 시가총액 상위 보통주 약 20개 종목으로 시작하며, 연구 진행에 따라 최대 수백 종목까지 확대할 수 있음</td></tr>
+  <tr><th>대상 기간</th><td>API가 제공하는 기간 내 과거 일별 시세 및 이후 매 영업일 신규 시세</td></tr>
+  <tr><th>사용 항목</th><td>기준일자, 단축코드, 종목명, 시장구분, 시가·고가·저가·종가, 거래량, 거래대금, 상장주식수, 시가총액</td></tr>
+  <tr><th>주요 요청변수</th><td>serviceKey, resultType(json), likeSrtnCd, beginBasDt, endBasDt, numOfRows, pageNo</td></tr>
+</table>
+
+<h2>4. 데이터 처리 흐름</h2>
+<ul>
+  <li><b>수집</b>: 종목·기간 단위로 조회하고, 페이지당 최대 행 수를 사용하여 호출 수를 최소화합니다.</li>
+  <li><b>원본 보관</b>: 응답 원문을 개인 PC에 캐시로 저장하여 같은 데이터를 다시 요청하지 않습니다.</li>
+  <li><b>검증</b>: 가격 정합성(저가 ≤ 시가·종가 ≤ 고가), 중복·결측 거래일, 비정상 변동을 검사합니다.</li>
+  <li><b>분석</b>: 검증된 데이터로 수익률 지표를 계산하고 예측 모델을 학습·평가합니다. 모든 처리는 개인 PC 안에서만 이루어집니다.</li>
+</ul>
+
+<h2>5. 호출량 계획</h2>
+<table>
+  <tr><th>초기 과거 데이터 수집</th><td>1회성. 종목당 수 건 이내 (예: 20종목 기준 약 100건 이내)</td></tr>
+  <tr><th>일상 갱신</th><td>데이터 갱신(영업일 다음날 오후 1시 이후) 후 1일 1회, 수십 건 이내</td></tr>
+  <tr><th>호출 제어</th><td>요청 간 최소 간격을 두고, 오류 시 재시도 횟수를 제한하며, 인증·요청 오류(4xx)는 재시도하지 않음. 개발계정 트래픽 한도 이내로 운영</td></tr>
+</table>
+
+<h2>6. 이용허락범위(제4유형) 준수 방안</h2>
+<ul>
+  <li><b>출처표시</b>: 연구 결과물과 소스 코드 문서에 「출처: 금융위원회, 공공데이터포털(data.go.kr)」을 표기합니다.</li>
+  <li><b>상업적 이용금지</b>: 데이터와 그 분석 결과를 판매·유료 제공하거나 영리 서비스에 사용하지 않습니다.</li>
+  <li><b>변경금지</b>: 원 데이터를 수정·가공하여 배포하지 않습니다. 원본과 가공 데이터 모두 개인 PC에만 보관하며, 공개 소스 저장소에는 데이터 파일을 올리지 않도록 설정합니다(.gitignore로 데이터 폴더 제외).</li>
+  <li><b>제3자 제공 금지</b>: 데이터 원문이나 데이터 파일을 제3자에게 제공하지 않습니다.</li>
+</ul>
+
+<h2>7. 인증키 관리 및 보안</h2>
+<ul>
+  <li>인증키는 소스 코드에 넣지 않고, 개인 PC의 환경변수(로컬 .env 파일)에서만 읽습니다.</li>
+  <li>.env 파일은 버전관리 대상에서 제외되어 외부 저장소에 올라가지 않습니다.</li>
+  <li>로그와 오류 메시지에 요청 URL을 남길 때 인증키 부분을 가립니다(예: serviceKey=****).</li>
+  <li>인증키가 노출된 것으로 의심되면 즉시 재발급을 요청합니다.</li>
+</ul>
+
+<h2>부록. API 호출 스크립트 (예시)</h2>
+<p class="note">실제 연구 코드에서 사용할 호출 방식의 요약입니다. 인증키는 환경변수에서 읽으며 코드와 문서에 포함하지 않습니다.</p>
+
+<p><b>(1) 요청 형식</b></p>
+<pre>GET https://apis.data.go.kr/1160100/GetStockSecuritiesInfoService_V2/getStockPriceInfo
+    ?serviceKey=****            (환경변수에서 읽음, 로그에서는 가림)
+    &amp;resultType=json
+    &amp;likeSrtnCd=005930          (종목 단축코드)
+    &amp;beginBasDt=20240101&amp;endBasDt=20241231
+    &amp;numOfRows=1000&amp;pageNo=1</pre>
+
+<p><b>(2) Rust 호출 코드</b></p>
+<pre>use std::{env, fs, time::Duration};
+
+const ENDPOINT: &amp;str =
+    "https://apis.data.go.kr/1160100/GetStockSecuritiesInfoService_V2/getStockPriceInfo";
+
+/// 로그·오류 메시지에 남기기 전에 인증키를 가린다.
+fn redact(text: &amp;str, key: &amp;str) -&gt; String {
+    text.replace(key, "****")
+}
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    // 인증키는 로컬 .env / 환경변수에서만 읽는다 (저장소에 포함하지 않음).
+    let key = env::var("DATA_GO_KR_SERVICE_KEY")?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    for code in ["005930", "000660"] {
+        let cache = format!("data/raw/data_go_kr/{code}_2024.json");
+        if fs::metadata(&amp;cache).is_ok() {
+            continue; // 이미 받은 데이터는 다시 요청하지 않는다.
+        }
+
+        let resp = client
+            .get(ENDPOINT)
+            .query(&amp;[
+                ("serviceKey", key.as_str()),
+                ("resultType", "json"),
+                ("likeSrtnCd", code),
+                ("beginBasDt", "20240101"),
+                ("endBasDt", "20241231"),
+                ("numOfRows", "1000"),
+                ("pageNo", "1"),
+            ])
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() =&gt; fs::write(&amp;cache, r.text().await?)?,
+            Ok(r) =&gt; eprintln!("{code}: HTTP {} (재시도하지 않음)", r.status()),
+            Err(e) =&gt; eprintln!("{code}: {}", redact(&amp;e.to_string(), &amp;key)),
+        }
+
+        // 요청 사이에 간격을 두어 서버 부하와 트래픽 한도를 지킨다.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok(())
+}</pre>
+
+<p class="note">출처: 금융위원회, 공공데이터포털(data.go.kr) — 금융위원회_주식시세정보</p>
+
+</body>
+</html>

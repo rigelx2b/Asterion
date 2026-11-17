@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asterion Monitor</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f3ef;
+  --surface-1: #fcfcfb;
+  --border: #e2e0d9;
+  --track: #e8e6df;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #7d7b74;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #111110;
+    --surface-1: #1a1a19;
+    --border: #2f2f2c;
+    --track: #2b2b28;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #8f8d85;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+header.top {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  max-width: 1120px; margin: 0 auto; padding: 20px 16px 8px;
+}
+header.top h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -0.01em; }
+.conn { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 12px; }
+.conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); }
+.conn.off .dot { background: var(--critical); }
+main { max-width: 1120px; margin: 0 auto; padding: 8px 16px 40px; display: grid; gap: 16px; }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.card-head h2 { margin: 0; font-size: 16px; font-weight: 650; }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
+  border: 1px solid var(--border); border-radius: 999px; font-size: 12px; color: var(--text-primary);
+}
+.badge .icon { font-weight: 700; }
+.badge[data-state="running"] .icon { color: var(--series-1); animation: pulse 1.4s ease-in-out infinite; }
+.badge[data-state="completed"] .icon { color: var(--good); }
+.badge[data-state="failed"] .icon { color: var(--critical); }
+.badge[data-state="stale"] .icon { color: var(--warning); }
+@keyframes pulse { 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) { .badge .icon { animation: none !important; } .bar > i { transition: none !important; } }
+.stage { margin-top: 14px; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.stage .name { color: var(--text-secondary); }
+.stage .count { font-size: 22px; font-weight: 650; letter-spacing: -0.01em; }
+.stage .count small { font-size: 13px; font-weight: 400; color: var(--text-secondary); margin-left: 6px; }
+.bar { height: 8px; border-radius: 4px; background: var(--track); overflow: hidden; margin-top: 8px; }
+.bar > i { display: block; height: 100%; width: 0; border-radius: 4px; background: var(--series-1); transition: width 0.6s ease; }
+.bar.thin { height: 4px; }
+.sub { margin-top: 10px; display: flex; justify-content: space-between; gap: 12px; color: var(--text-secondary); font-size: 12px; }
+.meta { margin-top: 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(156px, 1fr)); gap: 10px; }
+.tile { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; min-width: 0; }
+.tile .k { color: var(--text-muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .v { font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
+.error { margin-top: 12px; padding: 8px 12px; border: 1px solid var(--critical); border-radius: 8px; color: var(--text-primary); font-size: 13px; overflow-wrap: anywhere; }
+.charts { margin-top: 16px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 720px) { .charts { grid-template-columns: minmax(0, 1fr); } }
+.chart { position: relative; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px 6px; }
+.chart-head { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+.chart-head .t { color: var(--text-secondary); }
+.chart-head .latest { font-weight: 600; }
+.chart svg { display: block; width: 100%; height: auto; margin-top: 4px; }
+.chart .grid { stroke: var(--border); stroke-width: 1; }
+.chart .tick { fill: var(--text-muted); font-size: 11px; }
+.chart .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .cross { stroke: var(--text-muted); stroke-width: 1; }
+.chart .ring { stroke: var(--surface-1); stroke-width: 2; }
+.chart .placeholder { color: var(--text-muted); font-size: 12px; padding: 24px 0; text-align: center; }
+.tip {
+  position: absolute; pointer-events: none; transform: translate(-50%, -100%);
+  background: var(--text-primary); color: var(--surface-1); border-radius: 6px;
+  padding: 3px 8px; font-size: 12px; white-space: nowrap;
+}
+details { margin-top: 12px; }
+summary { cursor: pointer; color: var(--text-secondary); font-size: 13px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 13px; }
+th, td { padding: 5px 10px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--text-muted); font-weight: 500; }
+th:first-child, td:first-child, th:nth-child(2), td.l { text-align: left; }
+h3 { margin: 18px 0 0; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.empty { color: var(--text-secondary); text-align: center; padding: 48px 16px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1 id="title"></h1>
+  <span class="conn" id="conn"><span class="dot"></span><span id="conn-text"></span></span>
+</header>
+<main id="main"><div class="card empty" id="empty" hidden></div></main>
+<script>
+const T = {
+  title: "Asterion 모니터링 대시보드",
+  connected: "실시간 연결됨",
+  disconnected: "서버 연결 끊김",
+  empty: "아직 진행된 작업이 없습니다. 터미널에서 asterion fetch 또는 asterion train 명령을 실행하면 여기에 기록이 표시됩니다.",
+  kinds: {
+    "train": "모델 학습",
+    "fetch": "종목별 시세 수집",
+    "fetch-index": "시장 지수 수집",
+    "fetch-macro": "거시경제 지표 수집",
+    "fetch-disclosures": "DART 공시목록 수집",
+    "fetch-financials": "DART 재무제표 수집",
+    "evaluate": "동결 모델 테스트 평가",
+    "confidence": "신뢰도 선별 예측 및 구간 적합",
+    "fetch-investors": "투자자별 순매수 수집",
+  },
+  states: {
+    running: "진행 중",
+    completed: "완료",
+    failed: "실패",
+    stale: "응답 없음",
+  },
+  stages: {
+    fetching: "데이터 수집 중",
+    loading: "학습 데이터 준비 중",
+    baselines: "베이스라인 평가 중",
+    training: "신경망 학습 중",
+    evaluating: "최종 모델 평가",
+  },
+  step: "현재 epoch 진행률",
+  elapsed: "경과 시간",
+  eta: "남은 시간",
+  rate: "처리 속도",
+  perMinute: "/분",
+  current: "현재 항목",
+  updated: "최근 업데이트",
+  counters: {
+    requests: "API 요청 수",
+    failures: "실패 건수",
+    rows: "신규 수집 행",
+    symbols: "학습 종목 수",
+    samples_train: "학습 샘플 수",
+    samples_val: "검증 샘플 수",
+    samples_test: "테스트 샘플 수",
+    params: "파라미터 수",
+    best_val_accuracy: "최고 검증 방향정확도",
+    best_val_ic: "최고 검증 IC",
+    best_val_skill: "무변동 대비 최고 검증 가격정확도 스킬",
+    best_epoch: "최적 epoch",
+  },
+  lossTitle: "epoch별 학습 손실",
+  accTitle: "에포크별 검증 무변동 대비 단계별 가격 정확도 스킬",
+  chartEmpty: "첫 데이터가 기록되면 차트가 표시됩니다",
+  tableView: "표로 보기",
+  reportsTitle: "모델 및 예측 기간별 무변동 대비 단계별 가격정확도 스킬",
+  model: "모델명",
+  split: "데이터 분할",
+  average: "평균",
+  confTitle: "기간별 선별 예측·구간·순익 점검",
+  conf: {
+    horizon: "예측 기간",
+    coverage: "예측 채택률",
+    perDay: "일평균 예측 건수",
+    hit: "1% 오차 내 적중률",
+    naive: "가격 불변 시 1% 적중률",
+    interval: "80% 구간 실제 포함률",
+    width: "80% 구간 평균 폭",
+    signals: "순익 시그널 건수",
+    signalWin: "순익 시그널 실현율",
+    excess: "상위 10% 연환산 초과수익률",
+    excessWin: "상위 10% 시장 상회일 비율",
+  },
+};
+
+const STALE_MS = 120000;
+const KIND_ORDER = ["train", "evaluate", "confidence", "fetch", "fetch-index", "fetch-macro", "fetch-disclosures", "fetch-financials", "fetch-investors"];
+// Tiered credit minus the no-change credit; values are small, so they are shown signed.
+const skill = (v) => (v >= 0 ? "+" : "") + v.toFixed(5);
+const ICONS = { running: "●", completed: "✓", failed: "✕", stale: "!" };
+const int = new Intl.NumberFormat("ko-KR");
+const $ = (root, name) => root.querySelector(`[data-el="${name}"]`);
+const cards = new Map();
+
+function duration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  const s = Math.round(ms / 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  const h = Math.floor(s / 3600);
+  return (h ? h + ":" + pad(Math.floor((s % 3600) / 60)) : Math.floor(s / 60)) + ":" + pad(s % 60);
+}
+const pct = (v, digits = 2) => (v * 100).toFixed(digits) + "%";
+const clock = (iso) => new Date(iso).toLocaleTimeString("en-GB");
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function ensureCard(kind) {
+  if (cards.has(kind)) return cards.get(kind);
+  const card = el("section", "card");
+  card.innerHTML = `
+    <div class="card-head"><h2 data-el="title"></h2>
+      <span class="badge" data-el="badge"><span class="icon" data-el="icon"></span><span data-el="state"></span></span></div>
+    <div class="stage"><span class="name" data-el="stage"></span><span class="count" data-el="count"></span></div>
+    <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" data-el="bar"><i></i></div>
+    <div data-el="stepwrap" hidden>
+      <div class="sub"><span data-el="steplabel"></span><span data-el="stepcount"></span></div>
+      <div class="bar thin"><i data-el="stepbar"></i></div>
+    </div>
+    <div class="error" data-el="error" hidden></div>
+    <div class="meta" data-el="meta"></div>
+    <div data-el="training" hidden>
+      <div class="charts"><div class="chart" data-el="loss"></div><div class="chart" data-el="acc"></div></div>
+      <details><summary data-el="tablelabel"></summary><div class="scroll" data-el="epochs"></div></details>
+    </div>
+    <div data-el="reports" hidden><h3 data-el="reportstitle"></h3><div class="scroll" data-el="reportstable"></div></div>
+    <div data-el="conf" hidden></div>`;
+  $(card, "title").textContent = T.kinds[kind] || kind;
+  $(card, "steplabel").textContent = T.step;
+  $(card, "tablelabel").textContent = T.tableView;
+  $(card, "reportstitle").textContent = T.reportsTitle;
+  cards.set(kind, card);
+  return card;
+}
+
+function tiles(container, entries) {
+  const sig = JSON.stringify(entries);
+  if (container.dataset.sig === sig) return;
+  container.dataset.sig = sig;
+  container.replaceChildren(...entries.map(([k, v]) => {
+    const tile = el("div", "tile");
+    tile.append(el("div", "k", k), el("div", "v", v));
+    return tile;
+  }));
+}
+
+function drawChart(container, title, points, color, format) {
+  const sig = JSON.stringify(points);
+  if (container.dataset.sig === sig) return;
+  container.dataset.sig = sig;
+  const head = el("div", "chart-head");
+  head.append(el("span", "t", title), el("span", "latest", points.length ? format(points[points.length - 1].y) : ""));
+  if (!points.length) {
+    container.replaceChildren(head, el("div", "placeholder", T.chartEmpty));
+    return;
+  }
+  const W = 480, H = 170, L = 56, R = 14, TOP = 10, B = 24;
+  const xs = points.map((p) => p.x), ys = points.map((p) => p.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  let y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const span = (y1 - y0) || Math.abs(y1) * 0.1 || 1;
+  y0 = Math.min(...ys) >= 0 ? Math.max(0, y0 - span * 0.1) : y0 - span * 0.1; y1 += span * 0.1;
+  const px = (x) => (x1 === x0 ? (L + W - R) / 2 : L + ((x - x0) / (x1 - x0)) * (W - L - R));
+  const py = (y) => TOP + (1 - (y - y0) / (y1 - y0)) * (H - TOP - B);
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", title);
+  const add = (tag, attrs, text) => {
+    const node = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+    if (text !== undefined) node.textContent = text;
+    svg.append(node);
+    return node;
+  };
+  for (let i = 0; i <= 2; i++) {
+    const y = y0 + ((y1 - y0) * i) / 2;
+    add("line", { class: "grid", x1: L, x2: W - R, y1: py(y), y2: py(y) });
+    add("text", { class: "tick", x: L - 8, y: py(y) + 4, "text-anchor": "end" }, format(y));
+  }
+  const ticks = [...new Set([x0, Math.round((x0 + x1) / 2), x1])];
+  for (const x of ticks) add("text", { class: "tick", x: px(x), y: H - 6, "text-anchor": "middle" }, String(x));
+  add("path", { class: "line", stroke: color, d: points.map((p, i) => (i ? "L" : "M") + px(p.x).toFixed(1) + " " + py(p.y).toFixed(1)).join(" ") });
+  if (points.length <= 24) for (const p of points) add("circle", { class: "ring", fill: color, cx: px(p.x), cy: py(p.y), r: 4 });
+  const cross = add("line", { class: "cross", y1: TOP, y2: H - B, visibility: "hidden" });
+  const dot = add("circle", { class: "ring", fill: color, r: 5, visibility: "hidden" });
+  const hit = add("rect", { x: L - 10, y: 0, width: W - L - R + 20, height: H, fill: "transparent" });
+  const tip = el("div", "tip");
+  tip.hidden = true;
+  hit.addEventListener("pointermove", (event) => {
+    const box = svg.getBoundingClientRect();
+    const scale = box.width / W;
+    const at = (event.clientX - box.left) / scale;
+    let best = points[0];
+    for (const p of points) if (Math.abs(px(p.x) - at) < Math.abs(px(best.x) - at)) best = p;
+    cross.setAttribute("x1", px(best.x)); cross.setAttribute("x2", px(best.x));
+    dot.setAttribute("cx", px(best.x)); dot.setAttribute("cy", py(best.y));
+    cross.setAttribute("visibility", "visible"); dot.setAttribute("visibility", "visible");
+    tip.textContent = `epoch ${best.x} · ${format(best.y)}`;
+    tip.hidden = false;
+    tip.style.left = svg.offsetLeft + px(best.x) * scale + "px";
+    tip.style.top = svg.offsetTop + py(best.y) * scale - 10 + "px";
+  });
+  hit.addEventListener("pointerleave", () => {
+    cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden");
+    tip.hidden = true;
+  });
+  container.replaceChildren(head, svg, tip);
+}
+
+function table(container, header, rows) {
+  const sig = JSON.stringify(rows);
+  if (container.dataset.sig === sig) return;
+  container.dataset.sig = sig;
+  const t = el("table");
+  const hr = t.createTHead().insertRow();
+  for (const h of header) hr.append(el("th", "", h));
+  const body = t.createTBody();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    row.forEach((cell, i) => tr.append(el("td", i < header.leftColumns ? "l" : "", cell)));
+  }
+  container.replaceChildren(t);
+}
+
+function update(card, run, now) {
+  const updated = Date.parse(run.updated_at);
+  const stale = run.state === "running" && now - updated > STALE_MS;
+  const state = stale ? "stale" : run.state;
+  const live = state === "running";
+  $(card, "badge").dataset.state = state;
+  $(card, "icon").textContent = ICONS[state];
+  $(card, "state").textContent = T.states[state];
+
+  const stepFrac = run.step_total ? run.step_done / run.step_total : 0;
+  const frac = run.total ? Math.min(1, (run.done + (run.done < run.total ? stepFrac : 0)) / run.total) : 0;
+  $(card, "stage").textContent = T.stages[run.stage] || run.stage;
+  const count = $(card, "count");
+  count.textContent = run.total ? `${int.format(run.done)} / ${int.format(run.total)}` : "";
+  if (run.total) count.append(el("small", "", pct(frac, 1)));
+  const bar = $(card, "bar");
+  bar.setAttribute("aria-valuenow", (frac * 100).toFixed(1));
+  bar.firstElementChild.style.width = frac * 100 + "%";
+
+  const showStep = live && run.stage === "training" && run.step_total > 0;
+  $(card, "stepwrap").hidden = !showStep;
+  if (showStep) {
+    $(card, "stepcount").textContent = `${int.format(run.step_done)} / ${int.format(run.step_total)}`;
+    $(card, "stepbar").style.width = stepFrac * 100 + "%";
+  }
+
+  const error = $(card, "error");
+  error.hidden = !run.error;
+  error.textContent = run.error || "";
+
+  const end = live ? now : updated;
+  const stageMs = end - Date.parse(run.stage_started_at);
+  const entries = [[T.elapsed, duration(end - Date.parse(run.started_at))]];
+  if (live) {
+    entries.push([T.eta, frac > 0.002 ? duration((stageMs * (1 - frac)) / frac) : "—"]);
+    if (run.current) entries.push([T.current, run.current]);
+  }
+  const units = run.done + (run.done < run.total ? stepFrac : 0);
+  if (units > 0 && stageMs > 0 && (run.stage === "training" || run.stage === "fetching")) {
+    entries.push([T.rate, run.stage === "training"
+      ? duration(stageMs / units) + " / epoch"
+      : (units / (stageMs / 60000)).toFixed(1) + T.perMinute]);
+  }
+  for (const [key, value] of Object.entries(run.counters || {})) {
+    entries.push([T.counters[key] || key, key === "best_val_accuracy" ? pct(value) : key === "best_val_skill" ? skill(value) : key.endsWith("_ic") ? value.toFixed(4) : int.format(value)]);
+  }
+  entries.push([T.updated, clock(run.updated_at)]);
+  tiles($(card, "meta"), entries);
+
+  const epochs = run.epochs || [];
+  const training = run.kind === "train" && (run.stage === "training" || epochs.length > 0);
+  $(card, "training").hidden = !training;
+  if (training) {
+    const lossFormat = (v) => v.toFixed(5);
+    drawChart($(card, "loss"), T.lossTitle, epochs.map((e) => ({ x: e.epoch, y: e.train_loss })), "var(--series-1)", lossFormat);
+    drawChart($(card, "acc"), T.accTitle,
+      epochs.filter((e) => e.val_accuracy != null).map((e) => ({ x: e.epoch, y: e.val_accuracy })), "var(--series-2)", skill);
+    const header = Object.assign(["epoch", T.lossTitle, T.accTitle], { leftColumns: 1 });
+    table($(card, "epochs"), header, epochs.map((e) =>
+      [String(e.epoch), lossFormat(e.train_loss), e.val_accuracy == null ? "—" : skill(e.val_accuracy)]));
+  }
+
+  const all = run.tables || [];
+  // Confidence reports carry a selection block per horizon; the rest are accuracy reports.
+  const isConf = (r) => r.horizons && r.horizons[0] && r.horizons[0].selection;
+  const reports = all.filter((r) => !isConf(r));
+  const confs = all.filter(isConf);
+  const confBox = $(card, "conf");
+  confBox.hidden = !confs.length;
+  const confSig = JSON.stringify(confs);
+  if (confs.length && confBox.dataset.sig !== confSig) {
+    confBox.dataset.sig = confSig;
+    confBox.replaceChildren();
+    const C = T.conf;
+    const signed = (v) => (v >= 0 ? "+" : "") + (v * 100).toFixed(2) + "%";
+    const num = (v) => (Number.isFinite(v) ? v : NaN);
+    for (const r of confs) {
+      confBox.append(el("h3", "", T.confTitle + " · " + r.split_name));
+      const box = el("div", "scroll");
+      confBox.append(box);
+      const header = Object.assign([C.horizon, C.coverage, C.perDay, C.hit, C.naive, C.interval, C.width, C.signals, C.signalWin, C.excess, C.excessWin], { leftColumns: 1 });
+      table(box, header, r.horizons.map((h) => {
+        const s = h.selection;
+        const i80 = h.intervals.find((i) => Math.abs(i.level - 0.8) < 1e-9) || h.intervals[0];
+        const g = h.signals.find((x) => Math.abs(x.confidence - 0.9) < 1e-9) || h.signals[0];
+        const p = h.portfolio;
+        return ["t+" + h.horizon,
+          s.max_scale == null ? "—" : pct(num(s.coverage), 1),
+          s.max_scale == null ? "—" : num(s.per_date).toFixed(1),
+          s.max_scale == null ? "—" : pct(num(s.hit_rate), 1),
+          s.max_scale == null ? "—" : pct(num(s.naive_hit_rate), 1),
+          pct(num(i80.coverage), 1), pct(num(i80.mean_width), 1),
+          int.format(g.count), g.count ? pct(num(g.win_rate), 1) : "—",
+          signed(num(p.annualized_excess)), pct(num(p.excess_win_rate), 1)];
+      }));
+    }
+  }
+  $(card, "reports").hidden = !reports.length;
+  if (reports.length) {
+    const horizons = reports[0].horizons.map((h) => "t+" + h.horizon);
+    const header = Object.assign([T.model, T.split, ...horizons, T.average], { leftColumns: 2 });
+    table($(card, "reportstable"), header, reports.map((r) => {
+      const acc = r.horizons.map((h) => (h.tier_score ?? 0) - (h.naive_tier_score ?? 0));
+      return [r.model_name, r.split_name, ...acc.map(skill), skill(acc.reduce((a, b) => a + b, 0) / acc.length)];
+    }));
+  }
+}
+
+function render(payload) {
+  const main = document.getElementById("main");
+  const now = Date.now();
+  const rank = (run) => (run.state === "running" ? 0 : 1) * 10 + (KIND_ORDER.indexOf(run.kind) + 1 || 9);
+  const runs = [...payload.runs].sort((a, b) => rank(a) - rank(b));
+  document.getElementById("empty").hidden = runs.length > 0;
+  const wanted = runs.map((run) => {
+    const card = ensureCard(run.kind);
+    update(card, run, now);
+    return card;
+  });
+  for (const [kind, card] of cards) if (!wanted.includes(card)) { card.remove(); cards.delete(kind); }
+  wanted.forEach((card, i) => { if (main.children[i + 1] !== card) main.insertBefore(card, main.children[i + 1] || null); });
+}
+
+function connection(ok) {
+  document.getElementById("conn").classList.toggle("off", !ok);
+  document.getElementById("conn-text").textContent = ok ? T.connected : T.disconnected;
+}
+
+async function poll() {
+  try {
+    const response = await fetch("/api/status", { cache: "no-store" });
+    if (!response.ok) throw new Error(String(response.status));
+    render(await response.json());
+    connection(true);
+  } catch (_) {
+    connection(false);
+  }
+}
+
+document.title = T.title;
+document.getElementById("title").textContent = T.title;
+document.getElementById("empty").textContent = T.empty;
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>
