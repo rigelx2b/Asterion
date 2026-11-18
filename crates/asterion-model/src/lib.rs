@@ -11,6 +11,7 @@ pub mod disclosures;
 pub mod explain;
 pub mod features;
 pub mod fundamentals;
+pub mod history;
 mod labels;
 pub mod ledger;
 pub mod metrics;

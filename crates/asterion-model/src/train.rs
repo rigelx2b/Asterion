@@ -20,6 +20,7 @@ use crate::features::{
     DatasetSplits, FEATURE_NAMES, NUM_FEATURES, Sample, StandardScaler, bars_and_extras,
     extract_symbol_samples, to_excess_returns,
 };
+use crate::history::{SpliceCounts, samples_from, splice_history};
 use crate::metrics::{EvaluationReport, HORIZONS, price_error, tier_score};
 use crate::neural::{
     AdamW, Forecast, LossConfig, MultiHorizonNet, default_threads, evaluate_forecasts, get_params,
@@ -328,8 +329,30 @@ pub fn load_samples(
     context: &MarketContext,
     progress: &mut ProgressTracker,
 ) -> Result<(Vec<Sample>, usize), Box<dyn std::error::Error>> {
+    let (samples, loaded, _) = load_samples_with_history(cache, symbols, context, progress, None)?;
+    Ok((samples, loaded))
+}
+
+/// Where older KIS bars are cached and the first sample date to keep once spliced.
+#[derive(Debug, Clone)]
+pub struct HistoryOptions {
+    pub root: PathBuf,
+    pub adjusted: String,
+    pub samples_from: NaiveDate,
+}
+
+/// Like [`load_samples`], optionally splicing cached KIS bars in front of each
+/// data.go.kr series (see [`crate::history::splice_history`]).
+pub fn load_samples_with_history(
+    cache: &RawCache,
+    symbols: &[Symbol],
+    context: &MarketContext,
+    progress: &mut ProgressTracker,
+    history: Option<&HistoryOptions>,
+) -> Result<(Vec<Sample>, usize, SpliceCounts), Box<dyn std::error::Error>> {
     let mut all_samples = Vec::new();
     let mut loaded_count = 0;
+    let mut counts = SpliceCounts::default();
     progress.stage("loading", symbols.len() as u64);
     for (i, symbol) in symbols.iter().enumerate() {
         progress.current(symbol.code());
@@ -338,7 +361,16 @@ pub fn load_samples(
         let Some(latest) = quotes.last() else {
             continue;
         };
-        let (bars, extras) = bars_and_extras(&quotes);
+        let (mut bars, mut extras) = bars_and_extras(&quotes);
+        if let Some(opts) = history {
+            if asterion_data::kis::history_cached(&opts.root, symbol.code(), &opts.adjusted) {
+                let older =
+                    asterion_data::kis::load_history(&opts.root, symbol.code(), &opts.adjusted)?;
+                counts.add(splice_history(&older, &mut bars, &mut extras));
+            } else {
+                counts.missing_cache += 1;
+            }
+        }
         let samples = extract_symbol_samples(
             symbol.code(),
             &bars,
@@ -346,12 +378,16 @@ pub fn load_samples(
             &latest.market_category,
             context,
         );
+        let samples = match history {
+            Some(opts) => samples_from(samples, opts.samples_from),
+            None => samples,
+        };
         if !samples.is_empty() {
             loaded_count += 1;
         }
         all_samples.extend(samples);
     }
-    Ok((all_samples, loaded_count))
+    Ok((all_samples, loaded_count, counts))
 }
 
 // Validation forecasts of one network state, calibrated on slice A and scored on slice B.

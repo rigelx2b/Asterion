@@ -512,6 +512,11 @@ pub async fn collect_history(
     Ok((requests, rows))
 }
 
+/// True once `collect_history` has stored at least one window for `code`, even an empty one.
+pub fn history_cached(root: &Path, code: &str, adjusted: &str) -> bool {
+    root.join(code).join(adjusted).is_dir()
+}
+
 /// Every cached bar for `code` under one adjustment flag, sorted, one per date.
 pub fn load_history(root: &Path, code: &str, adjusted: &str) -> Result<Vec<ChartBar>, DataError> {
     let dir = root.join(code).join(adjusted);

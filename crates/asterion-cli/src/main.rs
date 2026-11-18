@@ -267,6 +267,33 @@ struct ResearchCvArgs {
 
     #[arg(
         long,
+        help = "Prepend cached KIS daily bars from fetch-history, rescaled onto data.go.kr series via 2020 overlap"
+    )]
+    with_history: bool,
+
+    #[arg(
+        long,
+        default_value = kis::HISTORY_ROOT,
+        help = "Directory of KIS daily chart responses from fetch-history (only read with --with-history)"
+    )]
+    history_root: PathBuf,
+
+    #[arg(
+        long,
+        value_parser = parse_date,
+        default_value = "2015-01-01",
+        help = "Earliest sample date with --with-history; older bars warm up features (disclosures/financials start 2015)"
+    )]
+    history_from: NaiveDate,
+
+    #[arg(
+        long,
+        help = "Allow running with an incomplete KIS history cache (smoke tests only)"
+    )]
+    allow_partial_history: bool,
+
+    #[arg(
+        long,
         default_value = "data/ledger/cv_2026-11-13/report.json",
         help = "Output path for the JSON cross-validation report"
     )]
@@ -1686,8 +1713,45 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
     let cache = RawCache::new(&args.universe.cache_dir);
     let symbols = resolve_symbols(&args.universe, &cache)?;
     let context = args.context.load()?;
-    let (samples, loaded) =
-        asterion_model::train::load_samples(&cache, &symbols, &context, progress)?;
+    // Same adjustment flag as the fetch-history default.
+    let history = args
+        .with_history
+        .then(|| asterion_model::train::HistoryOptions {
+            root: args.history_root.clone(),
+            adjusted: "0".to_owned(),
+            samples_from: args.history_from,
+        });
+    let (samples, loaded, splice) = asterion_model::train::load_samples_with_history(
+        &cache,
+        &symbols,
+        &context,
+        progress,
+        history.as_ref(),
+    )?;
+    if history.is_some() {
+        println!(
+            "history spliced={} prefix_bars={} no_history={} short_overlap={} unstable_basis={} gap={} missing_cache={}",
+            splice.spliced,
+            splice.prefix_bars,
+            splice.no_history,
+            splice.short_overlap,
+            splice.unstable_basis,
+            splice.gap,
+            splice.missing_cache
+        );
+        if splice.missing_cache > 0 && !args.allow_partial_history {
+            let missing = splice.missing_cache;
+            return Err(format!("{missing} universe symbols lack KIS history cache; finish fetch-history first or pass --allow-partial-history for a smoke test only").into());
+        }
+        let names = asterion_model::history::COVERAGE_FEATURES.join(",");
+        for (year, n, shares) in asterion_model::history::coverage_by_year(&samples) {
+            let shares: Vec<String> = shares.iter().map(|v| format!("{v:.3}")).collect();
+            println!(
+                "coverage year={year} samples={n} nonzero[{names}]={}",
+                shares.join(",")
+            );
+        }
+    }
     let topics =
         |code: &str, date: NaiveDate| context.disclosures.topic_features(code, date).to_vec();
     let panel = Panel::build_with(
