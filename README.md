@@ -132,10 +132,10 @@ Asterion은 한국 주식(KOSPI/KOSDAQ)의 미래 가격 및 수익률을 1, 3, 
 
 ### Purged Walk-Forward CV (랭킹 모델)
 
-- 설정: 2025-01-01부터의 윈도우, top-decile long-only, 비용 차감 후 기준.
-- `gbdt`: `IC` ~0.14–0.20 (`h5`–`h20`)
-- `ridge`: `IC` ~0.13–0.18
-- 대조군 대비 증분 초과수익(incremental excess)은 통계적으로 유의하지 않다(`t < 2.2`).
+- 설정 (`2026-11-13` 실행): 선택·판정용 dev 테스트 폴드 `2022`/`2023`/`2024`(확장 학습, `30`일 embargo), 상위 10분위 롱온리(top-decile long-only), 거래비용 차감 기준.
+- `gbdt` (dev 통합 `IC`): `h5` `0.138`, `h10` `0.159`, `h20` `0.189`.
+- `ridge` (dev 통합 `IC`): `h5` `0.133`, `h10` `0.157`, `h20` `0.189`; 대조군 대비 증분 초과수익(incremental excess)은 유의미하지 않음(`t` `0.95–1.30`).
+- `2025-01-01` 이후 burnt 구간(`--report-burnt`, 보고 전용·선택 미사용): `gbdt` `IC` `0.14–0.20`, `ridge` `IC` `0.13–0.18`, 증분 `t < 2.2`.
 - 최종 판정: `composite6`, `ridge`, `gbdt` 모두 `passed=false`.
 
 #### 2010–2019 과거 일봉 병합 (`research-cv --with-history`, 2026-11-19)
