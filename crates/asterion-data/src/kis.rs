@@ -24,6 +24,10 @@ pub const MIN_INTERVAL: Duration = Duration::from_millis(70);
 // Same-day figures are final only after the close; before this KST hour today's row is dropped.
 const FINAL_HOUR_KST: u32 = 18;
 const RATE_LIMIT_CODE: &str = "EGW00201";
+// Backend relay error seen in bursts under sustained chart requests; single retries succeed.
+const BACKEND_BUSY_CODE: &str = "OPSQ0008";
+// Waits before each retry of a busy-backend response.
+const BUSY_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 const CHART_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice";
 const CHART_TR_ID: &str = "FHKST03010100";
 pub const HISTORY_ROOT: &str = "data/raw/kis_daily";
@@ -221,7 +225,7 @@ impl KisClient {
         let auth = format!("Bearer {token}");
         let d1 = from.format("%Y%m%d").to_string();
         let d2 = to.format("%Y%m%d").to_string();
-        for attempt in 0..3 {
+        for attempt in 0..=BUSY_BACKOFF_SECS.len() {
             let text = self
                 .http
                 .send(|c| {
@@ -248,6 +252,12 @@ impl KisClient {
             }
             if env.msg_cd == RATE_LIMIT_CODE && attempt < 2 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            if env.msg_cd == BACKEND_BUSY_CODE
+                && let Some(&wait) = BUSY_BACKOFF_SECS.get(attempt)
+            {
+                tokio::time::sleep(Duration::from_secs(wait)).await;
                 continue;
             }
             return Err(DataError::Api {
@@ -732,6 +742,44 @@ mod tests {
             rows.iter()
                 .any(|r| r.date == NaiveDate::from_ymd_opt(2026, 11, 10).expect("date"))
         );
+    }
+
+    #[tokio::test]
+    async fn busy_backend_chart_responses_are_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(TOKEN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"access_token":"t"}"#))
+            .mount(&server)
+            .await;
+        let busy = r#"{"rt_cd":"1","msg_cd":"OPSQ0008","msg1":"busy","output2":[]}"#;
+        Mock::given(method("GET"))
+            .and(path(CHART_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(busy))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let ok = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":{},"output2":[]}"#;
+        Mock::given(method("GET"))
+            .and(path(CHART_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ok))
+            .mount(&server)
+            .await;
+        let keys = KisKeys {
+            app_key: "k".to_owned(),
+            app_secret: "s".to_owned(),
+        };
+        let mut client =
+            KisClient::new(keys, &server.uri(), RetryPolicy::default()).expect("client");
+        let day = NaiveDate::from_ymd_opt(2019, 1, 2).expect("date");
+        let body = client
+            .fetch_chart("000001", day, day, "0")
+            .await
+            .expect("retried after a busy response");
+        assert_eq!(body, ok);
     }
 
     #[test]
