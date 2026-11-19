@@ -19,6 +19,8 @@ pub const ATTRIBUTION: &str = "출처: 금융감독원 전자공시시스템(DAR
 
 // Without a corp_code the API rejects searches longer than three months.
 const MAX_WINDOW_DAYS: u64 = 85;
+// With a corp_code a three-year search is accepted (checked on 2015-2017).
+const CORP_WINDOW_DAYS: u64 = 1095;
 const PAGE_SIZE: &str = "100";
 const STATUS_OK: &str = "000";
 const STATUS_NO_DATA: &str = "013";
@@ -93,6 +95,29 @@ impl Feed {
 
     pub fn key(self) -> String {
         format!("{}_{}", self.kind.code(), self.board.code())
+    }
+}
+
+// One company's filings of one category, requested by corp_code across every board.
+// Used for companies the board feeds no longer return (delisted filers are class E).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CorpFeed {
+    pub corp_code: String,
+    pub kind: FilingKind,
+}
+
+impl CorpFeed {
+    pub fn key(&self) -> String {
+        format!("C{}_{}", self.corp_code, self.kind.code())
+    }
+
+    fn from_key(key: &str) -> Option<CorpFeed> {
+        let (corp_code, kind) = key.strip_prefix('C')?.split_once('_')?;
+        let kind = FilingKind::ALL.into_iter().find(|k| k.code() == kind)?;
+        (corp_code.len() == 8).then(|| CorpFeed {
+            corp_code: corp_code.to_owned(),
+            kind,
+        })
     }
 }
 
@@ -186,6 +211,36 @@ impl DartClient {
                     ("end_de", end.as_str()),
                     ("pblntf_ty", feed.kind.code()),
                     ("corp_cls", feed.board.code()),
+                    ("page_no", page_no.as_str()),
+                    ("page_count", PAGE_SIZE),
+                ],
+            )
+            .await
+    }
+}
+
+impl DartClient {
+    // Raw JSON body of one result page of one company's filings of one category.
+    pub async fn fetch_corp_page(
+        &mut self,
+        feed: &CorpFeed,
+        begin: NaiveDate,
+        end: NaiveDate,
+        page_no: u32,
+    ) -> Result<String, DataError> {
+        let begin = begin.format("%Y%m%d").to_string();
+        let end = end.format("%Y%m%d").to_string();
+        let page_no = page_no.to_string();
+        let endpoint = self.endpoint.clone();
+        self.http
+            .get(
+                &endpoint,
+                &[
+                    ("crtfc_key", self.key.0.as_str()),
+                    ("corp_code", feed.corp_code.as_str()),
+                    ("bgn_de", begin.as_str()),
+                    ("end_de", end.as_str()),
+                    ("pblntf_ty", feed.kind.code()),
                     ("page_no", page_no.as_str()),
                     ("page_count", PAGE_SIZE),
                 ],
@@ -292,13 +347,33 @@ pub fn pending_windows(
     begin: NaiveDate,
     end: NaiveDate,
 ) -> Result<Vec<(NaiveDate, NaiveDate)>, DataError> {
-    let manifest = cache.load_manifest_for(&feed.key())?;
+    pending_key_windows(cache, &feed.key(), begin, end, MAX_WINDOW_DAYS)
+}
+
+// Uncached parts of `[begin, end]` for one company feed, in corp_code-sized windows.
+pub fn pending_corp_windows(
+    cache: &RawCache,
+    feed: &CorpFeed,
+    begin: NaiveDate,
+    end: NaiveDate,
+) -> Result<Vec<(NaiveDate, NaiveDate)>, DataError> {
+    pending_key_windows(cache, &feed.key(), begin, end, CORP_WINDOW_DAYS)
+}
+
+fn pending_key_windows(
+    cache: &RawCache,
+    key: &str,
+    begin: NaiveDate,
+    end: NaiveDate,
+    window_days: u64,
+) -> Result<Vec<(NaiveDate, NaiveDate)>, DataError> {
+    let manifest = cache.load_manifest_for(key)?;
     let mut windows = Vec::new();
     for (range_begin, range_end) in missing_ranges(&manifest.covered(), begin, end) {
         let mut window_begin = range_begin;
         while window_begin <= range_end {
             let window_end = window_begin
-                .checked_add_days(Days::new(MAX_WINDOW_DAYS - 1))
+                .checked_add_days(Days::new(window_days - 1))
                 .map_or(range_end, |d| d.min(range_end));
             windows.push((window_begin, window_end));
             let Some(next) = window_end.succ_opt() else {
@@ -319,13 +394,46 @@ pub async fn collect_window(
     begin: NaiveDate,
     end: NaiveDate,
 ) -> Result<CollectOutcome, DataError> {
-    let key = feed.key();
+    collect_pages(client, cache, Target::Board(feed), begin, end).await
+}
+
+// Same as `collect_window` for one company's feed.
+pub async fn collect_corp_window(
+    client: &mut DartClient,
+    cache: &RawCache,
+    feed: &CorpFeed,
+    begin: NaiveDate,
+    end: NaiveDate,
+) -> Result<CollectOutcome, DataError> {
+    collect_pages(client, cache, Target::Corp(feed), begin, end).await
+}
+
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    Board(Feed),
+    Corp(&'a CorpFeed),
+}
+
+async fn collect_pages(
+    client: &mut DartClient,
+    cache: &RawCache,
+    target: Target<'_>,
+    begin: NaiveDate,
+    end: NaiveDate,
+) -> Result<CollectOutcome, DataError> {
+    let (key, kind) = match target {
+        Target::Board(feed) => (feed.key(), feed.kind),
+        Target::Corp(feed) => (feed.key(), feed.kind),
+    };
     let mut pages = Vec::new();
     let mut rows = 0;
     let mut page_no = 1;
     loop {
-        let body = client.fetch_page(feed, begin, end, page_no).await?;
-        let page = parse_page(&body, feed.kind)?;
+        let body = match target {
+            Target::Board(feed) => client.fetch_page(feed, begin, end, page_no).await?,
+            Target::Corp(feed) => client.fetch_corp_page(feed, begin, end, page_no).await?,
+        };
+        let page = parse_page(&body, kind)?;
         rows += page.filings.len();
         pages.push(cache.store_page_for(
             &key,
@@ -358,6 +466,36 @@ pub fn load_filings(cache: &RawCache) -> Result<Vec<Filing>, DataError> {
     let mut filings = Vec::new();
     for feed in Feed::all() {
         for cached in cache.load_bodies(&feed.key())? {
+            filings.extend(
+                parse_page(&cached.body, feed.kind)?
+                    .filings
+                    .into_iter()
+                    .filter(|f| f.date >= cached.begin && f.date <= cached.end),
+            );
+        }
+    }
+    filings.sort_by(|a, b| a.receipt_no.cmp(&b.receipt_no));
+    filings.dedup_by(|a, b| a.receipt_no == b.receipt_no);
+    filings.sort_by(|a, b| (a.date, &a.receipt_no).cmp(&(b.date, &b.receipt_no)));
+    Ok(filings)
+}
+
+// Every cached filing of the company feeds (`C<corp>_<kind>` keys) under `cache`, one per
+// receipt number, sorted by date. A missing root yields no filings.
+pub fn load_corp_filings(cache: &RawCache) -> Result<Vec<Filing>, DataError> {
+    let entries = match std::fs::read_dir(cache.root()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(DataError::io(cache.root(), e)),
+    };
+    let mut filings = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| DataError::io(cache.root(), e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(feed) = CorpFeed::from_key(&name) else {
+            continue;
+        };
+        for cached in cache.load_bodies(&name)? {
             filings.extend(
                 parse_page(&cached.body, feed.kind)?
                     .filings
@@ -455,5 +593,71 @@ mod tests {
         );
         assert_eq!(Feed::all().len(), 8);
         assert_eq!(format!("{:?}", DartKey::new("secret")), "DartKey(****)");
+    }
+
+    #[test]
+    fn corp_feed_windows_are_three_years_and_keys_round_trip() {
+        let feed = CorpFeed {
+            corp_code: "00790501".to_owned(),
+            kind: FilingKind::Major,
+        };
+        assert_eq!(feed.key(), "C00790501_B");
+        assert_eq!(CorpFeed::from_key(&feed.key()), Some(feed.clone()));
+        assert_eq!(CorpFeed::from_key("B_K"), None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = RawCache::with_source(dir.path(), SOURCE_ID);
+        let from = NaiveDate::from_ymd_opt(2015, 1, 1).expect("date");
+        let to = NaiveDate::from_ymd_opt(2020, 6, 30).expect("date");
+        let windows = pending_corp_windows(&cache, &feed, from, to).expect("windows");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(
+            windows[0].1,
+            NaiveDate::from_ymd_opt(2017, 12, 30).expect("date")
+        );
+        assert_eq!(
+            windows[1],
+            (NaiveDate::from_ymd_opt(2017, 12, 31).expect("date"), to)
+        );
+    }
+
+    #[test]
+    fn corp_filings_load_from_company_keys_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = RawCache::with_source(dir.path(), SOURCE_ID);
+        let body = r#"{"status":"000","message":"정상","page_no":1,"page_count":100,"total_count":2,"total_page":1,"list":[
+            {"corp_code":"00790501","corp_name":"한진해운","stock_code":"117930","corp_cls":"E","report_nm":"주요사항보고서(해산사유발생)","rcept_no":"20170220000001","flr_nm":"x","rcept_dt":"20170220","rm":""},
+            {"corp_code":"00790501","corp_name":"한진해운","stock_code":"117930","corp_cls":"E","report_nm":"outside the window","rcept_no":"20180102000001","flr_nm":"x","rcept_dt":"20180102","rm":""}
+        ]}"#;
+        let feed = CorpFeed {
+            corp_code: "00790501".to_owned(),
+            kind: FilingKind::Major,
+        };
+        let (begin, end) = (
+            NaiveDate::from_ymd_opt(2015, 1, 1).expect("date"),
+            NaiveDate::from_ymd_opt(2017, 12, 31).expect("date"),
+        );
+        let page = cache
+            .store_page_for(&feed.key(), begin, end, 1, body, 2, Utc::now())
+            .expect("store");
+        let mut manifest = cache.load_manifest_for(&feed.key()).expect("manifest");
+        manifest.ranges.push(FetchedRange {
+            begin,
+            end,
+            pages: vec![page],
+        });
+        cache
+            .save_manifest_for(&feed.key(), &manifest)
+            .expect("save");
+        let filings = load_corp_filings(&cache).expect("loads");
+        assert_eq!(filings.len(), 1);
+        assert_eq!(filings[0].stock_code, "117930");
+        assert_eq!(filings[0].kind, FilingKind::Major);
+        assert!(load_filings(&cache).expect("board feeds").is_empty());
+        let missing = RawCache::with_source(dir.path().join("none"), SOURCE_ID);
+        assert!(
+            load_corp_filings(&missing)
+                .expect("missing root")
+                .is_empty()
+        );
     }
 }

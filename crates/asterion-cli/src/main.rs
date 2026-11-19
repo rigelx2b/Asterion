@@ -118,6 +118,10 @@ enum Command {
     )]
     FetchCorpCodes(FetchCorpCodesArgs),
     #[command(
+        about = "Fetch per-company OpenDART filings and key accounts for missed delisted stocks into a resumable cache"
+    )]
+    FetchDartBackfill(FetchDartBackfillArgs),
+    #[command(
         about = "Fetch overseas daily price bars from KIS into raw cache with resumable sync and newest-page refresh"
     )]
     FetchOverseas(FetchOverseasArgs),
@@ -215,6 +219,37 @@ struct FetchHistoryArgs {
 struct FetchCorpCodesArgs {
     #[arg(long, default_value = dart_corp::DEFAULT_PATH, help = "Path of saved corpCode.xml file (replaced on each run)")]
     out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct FetchDartBackfillArgs {
+    #[command(flatten)]
+    universe: UniverseArgs,
+
+    #[arg(long, default_value = dart_corp::DEFAULT_PATH, help = "Path of the corpCode.xml file saved by fetch-corp-codes")]
+    corp_codes: PathBuf,
+
+    #[arg(long, default_value = opendart::DEFAULT_ROOT, help = "Directory of the main OpenDART filing cache; codes already mapped to a corp code are skipped")]
+    filing_cache_dir: PathBuf,
+
+    #[arg(
+        long,
+        help = "Output directory; stores filings and key accounts in filings and financials subdirectories"
+    )]
+    root: PathBuf,
+
+    #[arg(long, value_parser = parse_date, default_value = "2015-01-01", help = "Earliest filing receipt date to fetch, inclusive (same start as main filing cache)")]
+    from: NaiveDate,
+
+    #[arg(long, default_value_t = dart_financials::FIRST_YEAR, help = "First business year of key-account statements to fetch")]
+    from_year: i32,
+
+    #[arg(
+        long,
+        default_value_t = 8000,
+        help = "Maximum number of API requests to send in a single run"
+    )]
+    max_requests: u32,
 }
 
 #[derive(Debug, Args)]
@@ -362,16 +397,59 @@ struct ContextArgs {
 
     #[arg(long, default_value = dart_financials::DEFAULT_ROOT, help = "Directory with cached OpenDART financial statements for fundamental features")]
     financial_cache_dir: PathBuf,
+
+    #[arg(
+        long,
+        help = "Repeatable fetch-dart-backfill directory adding filings and key accounts for missing codes; fails on overlap"
+    )]
+    dart_backfill_root: Vec<PathBuf>,
 }
+
+// Subdirectories of a fetch-dart-backfill root.
+const BACKFILL_FILINGS_DIR: &str = "filings";
+const BACKFILL_FINANCIALS_DIR: &str = "financials";
 
 impl ContextArgs {
     fn load(&self) -> CliResult<asterion_model::MarketContext> {
-        Ok(asterion_model::MarketContext::load(
+        use asterion_model::context::DartBackfill;
+        let caches: Vec<(RawCache, RawCache)> = self
+            .dart_backfill_root
+            .iter()
+            .map(|root| {
+                (
+                    RawCache::with_source(root.join(BACKFILL_FILINGS_DIR), opendart::SOURCE_ID),
+                    RawCache::with_source(
+                        root.join(BACKFILL_FINANCIALS_DIR),
+                        dart_financials::SOURCE_ID,
+                    ),
+                )
+            })
+            .collect();
+        let backfill: Vec<DartBackfill<'_>> = caches
+            .iter()
+            .map(|(filings, financials)| DartBackfill {
+                filings,
+                financials,
+            })
+            .collect();
+        let (context, counts) = asterion_model::MarketContext::load_with_backfill(
             &RawCache::for_index(&self.index_cache_dir),
             &RawCache::with_source(&self.macro_cache_dir, fred::SOURCE_ID),
             &RawCache::with_source(&self.disclosure_cache_dir, opendart::SOURCE_ID),
             &RawCache::with_source(&self.financial_cache_dir, dart_financials::SOURCE_ID),
-        )?)
+            &backfill,
+        )?;
+        if !backfill.is_empty() {
+            println!(
+                "dart_backfill roots={} filing_codes={} filings={} report_codes={} reports={}",
+                backfill.len(),
+                counts.filing_codes,
+                counts.filings,
+                counts.report_codes,
+                counts.reports
+            );
+        }
+        Ok(context)
     }
 }
 
@@ -813,6 +891,11 @@ async fn main() -> ExitCode {
             finish(progress, result)
         }
         Command::FetchCorpCodes(args) => fetch_corp_codes(args).await,
+        Command::FetchDartBackfill(args) => {
+            let mut progress = ProgressTracker::start(&dir, "fetch-dart-backfill");
+            let result = fetch_dart_backfill(args, &mut progress).await;
+            finish(progress, result)
+        }
         Command::RankScore(args) => rank_score(args),
         Command::ResearchCv(args) => {
             let mut progress = ProgressTracker::start(&dir, "research-cv");
@@ -1622,6 +1705,150 @@ async fn fetch_corp_codes(args: FetchCorpCodesArgs) -> CliResult<ExitCode> {
         args.out.display()
     );
     Ok(ExitCode::SUCCESS)
+}
+
+async fn fetch_dart_backfill(
+    args: FetchDartBackfillArgs,
+    progress: &mut ProgressTracker,
+) -> CliResult<ExitCode> {
+    let cache = RawCache::new(&args.universe.cache_dir);
+    let symbols = resolve_symbols(&args.universe, &cache)?;
+    let mapped = opendart::load_corp_codes(&RawCache::with_source(
+        &args.filing_cache_dir,
+        opendart::SOURCE_ID,
+    ))?;
+    let by_stock: BTreeMap<String, String> = dart_corp::load(&args.corp_codes)?
+        .into_iter()
+        .filter(|e| !e.stock_code.is_empty())
+        .map(|e| (e.stock_code, e.corp_code))
+        .collect();
+    let missing: Vec<&str> = symbols
+        .iter()
+        .map(|s| s.code())
+        .filter(|code| !mapped.contains_key(*code))
+        .collect();
+    let mut corps = Vec::new();
+    let mut unresolved = Vec::new();
+    for code in &missing {
+        match by_stock.get(*code) {
+            Some(corp) => corps.push(corp.clone()),
+            None => unresolved.push(*code),
+        }
+    }
+    corps.sort();
+    corps.dedup();
+    println!(
+        "symbols={} already_mapped={} backfill_corps={} unresolved={}",
+        symbols.len(),
+        symbols.len() - missing.len(),
+        corps.len(),
+        unresolved.len()
+    );
+    if !unresolved.is_empty() {
+        println!("unresolved_codes={}", unresolved.join(","));
+    }
+    if corps.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let fin_cache = RawCache::with_source(
+        args.root.join(BACKFILL_FINANCIALS_DIR),
+        dart_financials::SOURCE_ID,
+    );
+    let filing_cache =
+        RawCache::with_source(args.root.join(BACKFILL_FILINGS_DIR), opendart::SOURCE_ID);
+    let today = (Utc::now() + chrono::Duration::hours(9)).date_naive();
+    // Filings of the current Korean day are still arriving, so stop at yesterday (KST).
+    let yesterday = today.pred_opt().ok_or("date out of range")?;
+    let mut client = DartClient::new(
+        DartKey::from_env()?,
+        opendart::ENDPOINT,
+        RetryPolicy::default(),
+    )?;
+    let (mut failures, mut rows, mut stop) = (0u32, 0usize, None);
+
+    let multi: Vec<Period> = dart_financials::periods(args.from_year, today)
+        .into_iter()
+        .filter(|p| dart_financials::multi_is_pending(&fin_cache, *p).unwrap_or(true))
+        .collect();
+    progress.stage("key-accounts", multi.len() as u64);
+    for (i, period) in multi.iter().enumerate() {
+        if client.requests_sent() >= args.max_requests {
+            stop = Some("max_requests");
+            break;
+        }
+        let label = format!("{} {}", period.year, period.report.code());
+        progress.current(&label);
+        let outcome =
+            dart_financials::collect_multi(&mut client, &fin_cache, *period, &corps).await;
+        let fatal = outcome.as_ref().is_err_and(DataError::is_fatal_for_batch);
+        match outcome {
+            Ok(o) => {
+                rows += o.rows;
+                println!("multi {label} pages={} reports={}", o.pages, o.rows);
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("multi {label}: {e}");
+            }
+        }
+        report_fetch(progress, client.requests_sent(), failures, rows, i);
+        if fatal {
+            stop = Some("api_error");
+            break;
+        }
+    }
+
+    if stop.is_none() {
+        let mut plan = Vec::new();
+        for corp in &corps {
+            for kind in opendart::FilingKind::ALL {
+                let feed = opendart::CorpFeed {
+                    corp_code: corp.clone(),
+                    kind,
+                };
+                for (begin, end) in
+                    opendart::pending_corp_windows(&filing_cache, &feed, args.from, yesterday)?
+                {
+                    plan.push((feed.clone(), begin, end));
+                }
+            }
+        }
+        progress.stage("filings", plan.len() as u64);
+        for (i, (feed, begin, end)) in plan.iter().enumerate() {
+            if client.requests_sent() >= args.max_requests {
+                stop = Some("max_requests");
+                break;
+            }
+            progress.current(&feed.key());
+            let outcome =
+                opendart::collect_corp_window(&mut client, &filing_cache, feed, *begin, *end).await;
+            let fatal = outcome.as_ref().is_err_and(DataError::is_fatal_for_batch);
+            match outcome {
+                Ok(o) => rows += o.rows,
+                Err(e) => {
+                    failures += 1;
+                    eprintln!("{} {begin}..{end}: {e}", feed.key());
+                }
+            }
+            report_fetch(progress, client.requests_sent(), failures, rows, i);
+            if fatal {
+                stop = Some("api_error");
+                break;
+            }
+        }
+    }
+    println!(
+        "fetch_dart_backfill_done requests={} failures={failures} rows={rows} stop={}",
+        client.requests_sent(),
+        stop.unwrap_or("complete")
+    );
+    println!("{}", opendart::ATTRIBUTION);
+    Ok(if failures == 0 && stop.is_none() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 // KIS sector codes for the two broad boards, in the order (KOSPI, KOSDAQ).

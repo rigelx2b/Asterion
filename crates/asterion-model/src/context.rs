@@ -232,6 +232,41 @@ pub struct MarketContext {
     pub fundamentals: FundamentalIndex,
 }
 
+/// Per-company OpenDART caches for filers the board feeds miss (delisted companies).
+#[derive(Debug, Clone, Copy)]
+pub struct DartBackfill<'a> {
+    pub filings: &'a RawCache,
+    pub financials: &'a RawCache,
+}
+
+/// Stock codes contributed by a `DartBackfill`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackfillCounts {
+    pub filing_codes: usize,
+    pub filings: usize,
+    pub report_codes: usize,
+    pub reports: usize,
+}
+
+// Backfill rows may only cover codes the main caches lack, so main codes stay bit-identical.
+fn disjoint_codes<'a>(
+    main: impl Iterator<Item = &'a str>,
+    extra: impl Iterator<Item = &'a str>,
+    field: &'static str,
+) -> Result<usize, DataError> {
+    let main: std::collections::BTreeSet<&str> = main.collect();
+    let extra: std::collections::BTreeSet<&str> = extra.collect();
+    let shared: Vec<&str> = extra.intersection(&main).copied().collect();
+    if shared.is_empty() {
+        Ok(extra.len())
+    } else {
+        Err(DataError::InvalidField {
+            field,
+            value: shared.join(","),
+        })
+    }
+}
+
 impl MarketContext {
     // Missing caches load as empty series, which turn into neutral feature values.
     pub fn load(
@@ -240,6 +275,46 @@ impl MarketContext {
         disclosure_cache: &RawCache,
         financial_cache: &RawCache,
     ) -> Result<Self, DataError> {
+        Ok(Self::load_with_backfill(
+            index_cache,
+            macro_cache,
+            disclosure_cache,
+            financial_cache,
+            &[],
+        )?
+        .0)
+    }
+
+    // Like `load`, adding filings and key accounts from `backfill` for codes the main
+    // caches do not contain; a code present in both is an error.
+    pub fn load_with_backfill(
+        index_cache: &RawCache,
+        macro_cache: &RawCache,
+        disclosure_cache: &RawCache,
+        financial_cache: &RawCache,
+        backfill: &[DartBackfill<'_>],
+    ) -> Result<(Self, BackfillCounts), DataError> {
+        let mut filings = opendart::load_filings(disclosure_cache)?;
+        let mut reports = dart_financials::load_reports(financial_cache)?;
+        let mut counts = BackfillCounts::default();
+        for extra in backfill {
+            let extra_filings = opendart::load_corp_filings(extra.filings)?;
+            let extra_reports = dart_financials::load_reports(extra.financials)?;
+            counts.filing_codes += disjoint_codes(
+                filings.iter().map(|f| f.stock_code.as_str()),
+                extra_filings.iter().map(|f| f.stock_code.as_str()),
+                "backfill_filing_codes",
+            )?;
+            counts.report_codes += disjoint_codes(
+                reports.iter().map(|r| r.stock_code.as_str()),
+                extra_reports.iter().map(|r| r.stock_code.as_str()),
+                "backfill_report_codes",
+            )?;
+            counts.filings += extra_filings.len();
+            counts.reports += extra_reports.len();
+            filings.extend(extra_filings);
+            reports.extend(extra_reports);
+        }
         let index = |spec| -> Result<DailySeries, DataError> {
             let quotes = index_cache.load_index_quotes(spec)?;
             Ok(DailySeries::from_points(
@@ -258,7 +333,7 @@ impl MarketContext {
                 observations.iter().map(|o| (o.date, o.value)),
             ))
         };
-        Ok(MarketContext {
+        let context = MarketContext {
             kospi: index(&KOSPI)?,
             kosdaq: index(&KOSDAQ)?,
             sp500: series(fred::SP500)?,
@@ -275,11 +350,10 @@ impl MarketContext {
             baa_yield: levels(fred::BAA_YIELD)?,
             nasdaq_vol: series(fred::NASDAQ_VOL)?,
             breakeven: levels(fred::BREAKEVEN_10Y)?,
-            disclosures: DisclosureIndex::from_filings(opendart::load_filings(disclosure_cache)?),
-            fundamentals: FundamentalIndex::from_reports(dart_financials::load_reports(
-                financial_cache,
-            )?),
-        })
+            disclosures: DisclosureIndex::from_filings(filings),
+            fundamentals: FundamentalIndex::from_reports(reports),
+        };
+        Ok((context, counts))
     }
 
     // The broad index of the board a stock is listed on.
@@ -382,6 +456,17 @@ mod tests {
             current.clone().prepend_checked(&gapped),
             Err(IndexSpliceError::Gap { days: 22, .. })
         ));
+    }
+
+    #[test]
+    fn backfill_codes_must_not_overlap_main_codes() {
+        let main = ["000020", "005930"];
+        let added = disjoint_codes(main.into_iter(), ["117930", "117930"].into_iter(), "t");
+        assert_eq!(added.expect("disjoint"), 1);
+        match disjoint_codes(main.into_iter(), ["005930", "117930"].into_iter(), "t") {
+            Err(DataError::InvalidField { value, .. }) => assert_eq!(value, "005930"),
+            other => panic!("expected an overlap error, got {other:?}"),
+        }
     }
 
     #[test]
