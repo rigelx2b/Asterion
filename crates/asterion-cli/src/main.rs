@@ -10,6 +10,7 @@ use asterion_core::{Market, Symbol};
 use asterion_data::DataError;
 use asterion_data::dart_corp;
 use asterion_data::dart_financials::{self, Period};
+use asterion_data::dart_shares;
 use asterion_data::data_go_kr::{
     ATTRIBUTION, ClientConfig, DataGoKrClient, INDICES, SOURCE_ID, collect_index, collect_symbol,
     fetch_snapshot, latest_available_date, missing_ranges, select_top_by_market_cap,
@@ -250,6 +251,12 @@ struct FetchDartBackfillArgs {
         help = "Maximum number of API requests to send in a single run"
     )]
     max_requests: u32,
+
+    #[arg(
+        long,
+        help = "Also fetch OpenDART issued common share counts from --from-year through this year into the shares subdirectory"
+    )]
+    shares_to_year: Option<i32>,
 }
 
 #[derive(Debug, Args)]
@@ -408,6 +415,7 @@ struct ContextArgs {
 // Subdirectories of a fetch-dart-backfill root.
 const BACKFILL_FILINGS_DIR: &str = "filings";
 const BACKFILL_FINANCIALS_DIR: &str = "financials";
+const BACKFILL_SHARES_DIR: &str = "shares";
 
 impl ContextArgs {
     fn load(&self) -> CliResult<asterion_model::MarketContext> {
@@ -1728,10 +1736,14 @@ async fn fetch_dart_backfill(
         .filter(|code| !mapped.contains_key(*code))
         .collect();
     let mut corps = Vec::new();
+    let mut pairs = Vec::new();
     let mut unresolved = Vec::new();
     for code in &missing {
         match by_stock.get(*code) {
-            Some(corp) => corps.push(corp.clone()),
+            Some(corp) => {
+                corps.push(corp.clone());
+                pairs.push((*code, corp.as_str()));
+            }
             None => unresolved.push(*code),
         }
     }
@@ -1829,6 +1841,49 @@ async fn fetch_dart_backfill(
                 Err(e) => {
                     failures += 1;
                     eprintln!("{} {begin}..{end}: {e}", feed.key());
+                }
+            }
+            report_fetch(progress, client.requests_sent(), failures, rows, i);
+            if fatal {
+                stop = Some("api_error");
+                break;
+            }
+        }
+    }
+    if stop.is_none()
+        && let Some(to_year) = args.shares_to_year
+    {
+        let share_cache =
+            RawCache::with_source(args.root.join(BACKFILL_SHARES_DIR), dart_shares::SOURCE_ID);
+        let mut plan = Vec::new();
+        for (stock, corp) in &pairs {
+            for period in dart_financials::periods(args.from_year, today) {
+                if period.year <= to_year
+                    && dart_shares::is_pending(&share_cache, stock, period).unwrap_or(true)
+                {
+                    plan.push((*stock, *corp, period));
+                }
+            }
+        }
+        progress.stage("shares", plan.len() as u64);
+        for (i, (stock, corp, period)) in plan.iter().enumerate() {
+            if client.requests_sent() >= args.max_requests {
+                stop = Some("max_requests");
+                break;
+            }
+            progress.current(stock);
+            let outcome =
+                dart_shares::collect(&mut client, &share_cache, stock, corp, *period).await;
+            let fatal = outcome.as_ref().is_err_and(DataError::is_fatal_for_batch);
+            match outcome {
+                Ok(o) => rows += o.rows,
+                Err(e) => {
+                    failures += 1;
+                    eprintln!(
+                        "shares {stock} {} {}: {e}",
+                        period.year,
+                        period.report.code()
+                    );
                 }
             }
             report_fetch(progress, client.requests_sent(), failures, rows, i);

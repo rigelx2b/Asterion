@@ -4,6 +4,7 @@ pub mod adjust;
 pub mod cache;
 pub mod dart_corp;
 pub mod dart_financials;
+pub mod dart_shares;
 pub mod data_go_kr;
 pub mod error;
 pub mod fred;
