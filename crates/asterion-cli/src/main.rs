@@ -1,6 +1,6 @@
 //! `asterion` command-line entry point.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -382,6 +382,41 @@ struct ResearchCvArgs {
         help = "Directory of KIS daily index chart responses from fetch-index-history (only read with --with-index-history)"
     )]
     index_history_root: PathBuf,
+
+    #[arg(
+        long,
+        requires = "with_history",
+        help = "Add KRX delisted names from --history-from via KIS bars; distress exits at 0, else last price (--with-history)"
+    )]
+    with_delisted: bool,
+
+    #[arg(
+        long,
+        default_value = "data/raw/krx_delisted/delisted_kospi.xls",
+        help = "Path to KRX KIND KOSPI delisting list (EUC-KR HTML .xls; only read with --with-delisted)"
+    )]
+    delisted_kospi: PathBuf,
+
+    #[arg(
+        long,
+        default_value = "data/raw/krx_delisted/delisted_kosdaq.xls",
+        help = "Path to KRX KIND KOSDAQ delisting list (EUC-KR HTML .xls; only read with --with-delisted)"
+    )]
+    delisted_kosdaq: PathBuf,
+
+    #[arg(
+        long,
+        default_value = "data/raw/kis_daily_delisted",
+        help = "Directory of delisted KIS chart responses from fetch-history --skip-leading-empty (only read with --with-delisted)"
+    )]
+    delisted_history_root: PathBuf,
+
+    #[arg(
+        long,
+        default_value = "data/raw/opendart_backfill/delisted2015/shares",
+        help = "OpenDART share counts from fetch-dart-backfill --shares-to-year for market cap (only read with --with-delisted)"
+    )]
+    delisted_shares_root: PathBuf,
 
     #[arg(
         long,
@@ -2143,6 +2178,61 @@ fn rank_score(args: RankLedgerArgs) -> CliResult<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+// Training samples of names delisted since --history-from that are not in the universe.
+fn load_delisted(
+    args: &ResearchCvArgs,
+    symbols: &[Symbol],
+    context: &asterion_model::MarketContext,
+) -> CliResult<Vec<asterion_model::features::Sample>> {
+    use asterion_data::krx_delisted;
+    use asterion_model::survivorship;
+    let lists = vec![
+        ("KOSPI", krx_delisted::load(&args.delisted_kospi)?),
+        ("KOSDAQ", krx_delisted::load(&args.delisted_kosdaq)?),
+    ];
+    let universe: BTreeSet<String> = symbols.iter().map(|s| s.code().to_owned()).collect();
+    let names = survivorship::select_delisted(&lists, &universe, args.history_from)?;
+    let shares = dart_shares::load(&RawCache::with_source(
+        &args.delisted_shares_root,
+        dart_shares::SOURCE_ID,
+    ))?;
+    let (samples, c, missing) = survivorship::load_delisted_samples(
+        &names,
+        &args.delisted_history_root,
+        "0",
+        &shares,
+        context,
+        args.history_from,
+    )?;
+    println!(
+        "delisted names={} distress={} no_shares={} samples={} terminal_exits={} halt_sessions_skipped={} missing_history={}",
+        c.names,
+        c.distress,
+        c.no_shares,
+        c.samples,
+        c.terminal_exits,
+        c.halt_sessions_skipped,
+        missing.len()
+    );
+    let names = asterion_model::history::COVERAGE_FEATURES.join(",");
+    for (year, n, shares) in asterion_model::history::coverage_by_year(&samples) {
+        let shares: Vec<String> = shares.iter().map(|v| format!("{v:.3}")).collect();
+        println!(
+            "delisted_coverage year={year} samples={n} nonzero[{names}]={}",
+            shares.join(",")
+        );
+    }
+    if !missing.is_empty() && !args.allow_partial_history {
+        return Err(format!(
+            "{} delisted names lack KIS history cache: {}",
+            missing.len(),
+            missing.join(",")
+        )
+        .into());
+    }
+    Ok(samples)
+}
+
 fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResult<ExitCode> {
     use asterion_model::research::{Fold, Panel, run_cv};
     let cache = RawCache::new(&args.universe.cache_dir);
@@ -2190,6 +2280,10 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
                 shares.join(",")
             );
         }
+    }
+    let mut samples = samples;
+    if args.with_delisted {
+        samples.extend(load_delisted(&args, &symbols, &context)?);
     }
     let topics =
         |code: &str, date: NaiveDate| context.disclosures.topic_features(code, date).to_vec();

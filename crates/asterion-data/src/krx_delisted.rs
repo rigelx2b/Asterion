@@ -49,6 +49,12 @@ const RULES: &[(&str, DelistingKind)] = &[
     ("주식분산미달", DelistingKind::Distress),
 ];
 
+/// Whether the row records a KOSDAQ name moving to the KOSPI board (still listed).
+pub fn is_board_transfer(reason: &str) -> bool {
+    let compact: String = reason.chars().filter(|c| !c.is_whitespace()).collect();
+    compact == "유가증권시장상장"
+}
+
 /// Kind of one reason, or `None` when no rule matches (callers must fail on it).
 pub fn classify(reason: &str) -> Option<DelistingKind> {
     let compact: String = reason.chars().filter(|c| !c.is_whitespace()).collect();
@@ -199,6 +205,8 @@ mod tests {
             assert_eq!(classify(r), Some(DelistingKind::Distress), "{r}");
         }
         assert_eq!(classify("상장폐지 사유 미상"), None);
+        assert!(is_board_transfer("유가증권시장 상장"));
+        assert!(!is_board_transfer("피흡수합병"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod predict;
 pub mod rank_ledger;
 pub mod research;
 pub mod strategy;
+pub mod survivorship;
 pub mod train;
 
 pub use baseline::{
