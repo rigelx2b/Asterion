@@ -278,9 +278,10 @@ pub fn infer_kind(bars: &[Bar]) -> DelistingKind {
 // Share-count changes smaller than this are rounding, not a corporate action.
 const SHARE_CHANGE_TOLERANCE: f64 = 0.01;
 
-/// Bars with every session from the final halt on rescaled onto the pre-halt share
-/// count (implied by unadjusted market cap over close). A capital reduction during the
-/// halt is not in the exchange base price, so liquidation prices would otherwise jump.
+/// Bars with every session from the final halt on that follows a share-count reduction
+/// rescaled onto the pre-halt count (implied by unadjusted market cap over close). A
+/// capital reduction during the halt is not in the exchange base price, so liquidation
+/// prices would otherwise jump.
 pub fn share_basis_after_halt(bars: &[Bar], extras: &[BarExtra]) -> Vec<Bar> {
     let mut out = bars.to_vec();
     let Some(h) = final_halt_start(bars).filter(|&h| h > 0) else {
@@ -298,7 +299,9 @@ pub fn share_basis_after_halt(bars: &[Bar], extras: &[BarExtra]) -> Vec<Bar> {
             continue;
         };
         let f = now / base;
-        if (f - 1.0).abs() > SHARE_CHANGE_TOLERANCE {
+        // Only reductions preserve value per old share; new shares (conversions, rights)
+        // dilute, so the traded price is already what an old holder owns.
+        if f < 1.0 - SHARE_CHANGE_TOLERANCE {
             b.open *= f;
             b.high *= f;
             b.low *= f;
@@ -478,6 +481,20 @@ mod tests {
         assert_eq!(rebased[9].close, 2000.0);
         assert_eq!(infer_kind(&rebased), DelistingKind::Distress);
         assert_eq!(infer_kind(&bars), DelistingKind::LastPrice);
+        // New shares issued during the halt dilute: traded prices stay as they are.
+        let diluted: Vec<BarExtra> = extras
+            .iter()
+            .enumerate()
+            .map(|(i, e)| BarExtra {
+                market_cap: if i >= 15 {
+                    bars[i].close * 4000.0
+                } else {
+                    e.market_cap
+                },
+                trading_value: 0.0,
+            })
+            .collect();
+        assert_eq!(share_basis_after_halt(&bars, &diluted)[16].close, 40_000.0);
     }
 
     #[test]
