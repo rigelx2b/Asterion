@@ -136,14 +136,23 @@ fn score_rows(panel: &Panel, scorer: &crate::research::Scorer, test: &[usize]) -
     })
 }
 
-/// Primary-horizon folds under one audit mode. `keep` masks rows out of train and test;
-/// with `placebo_seed`, models are fitted on shuffled labels and judged on the true ones.
+/// Row masks of an audit run; `false` drops the row.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Masks<'a> {
+    // Applied to train and test.
+    pub both: Option<&'a [bool]>,
+    // Applied to train only.
+    pub train: Option<&'a [bool]>,
+}
+
+/// Primary-horizon folds under one audit mode, with rows masked by `keep`; with
+/// `placebo_seed`, models are fitted on shuffled labels and judged on the true ones.
 pub fn run_audit(
     panel: &mut Panel,
     folds: &[Fold],
     embargo: u64,
     mode: AuditMode,
-    keep: Option<&[bool]>,
+    keep: Masks<'_>,
     placebo_seed: Option<u64>,
     log: &dyn Fn(&str),
 ) -> (AuditReport, Vec<AuditRow>) {
@@ -158,9 +167,12 @@ pub fn run_audit(
     let mut test_rows = Vec::new();
     for (fi, &fold) in folds.iter().enumerate() {
         let (mut train, mut test) = split(panel, fold, embargo);
-        if let Some(mask) = keep {
+        if let Some(mask) = keep.both {
             train.retain(|&i| mask[i]);
             test.retain(|&i| mask[i]);
+        }
+        if let Some(mask) = keep.train {
+            train.retain(|&i| mask[i]);
         }
         if let Some(seed) = placebo_seed {
             permute_labels(panel, seed.wrapping_add(fi as u64));
@@ -266,6 +278,7 @@ pub fn infer_kind(bars: &[Bar]) -> DelistingKind {
 /// Rows dated on or after `from` of a universe name whose bars stop before the data end,
 /// labelled like delisted training rows (exits through the final halt and liquidation
 /// window instead of stale halted closes; rows from the halt on are not sampled).
+/// `target_end` is the scheduled horizon end, so the rows are for test windows only.
 pub fn stopped_name_samples(
     symbol: &str,
     bars: &[Bar],
@@ -281,6 +294,14 @@ pub fn stopped_name_samples(
     let (mut samples, _) =
         extract_delisted_samples(symbol, bars, extras, market_category, ctx, kind, last.date);
     samples.retain(|s| s.date >= from);
+    // Test membership by the scheduled last session, not the (often months later) exit:
+    // these rows then carry information past `target_end` and must never train.
+    let max_horizon = *HORIZONS.iter().max().unwrap_or(&20);
+    for s in &mut samples {
+        if let Ok(t) = bars.binary_search_by_key(&s.date, |b| b.date) {
+            s.target_end = bars[(t + max_horizon).min(bars.len() - 1)].date;
+        }
+    }
     (samples, kind)
 }
 
@@ -346,6 +367,39 @@ mod tests {
             rows,
             groups,
         }
+    }
+
+    #[test]
+    fn relabelled_rows_keep_the_scheduled_target_end_and_the_liquidation_exit() {
+        let day = |i: usize| {
+            NaiveDate::from_ymd_opt(2024, 1, 1)
+                .and_then(|d| d.checked_add_days(chrono::Days::new(i as u64)))
+                .expect("date")
+        };
+        let mut spec: Vec<(f64, u64)> = (0..100).map(|i| (100.0 + i as f64, 10)).collect();
+        spec.extend([(199.0, 0); 30]);
+        spec.extend([(40.0, 10), (20.0, 10)]);
+        let bars: Vec<Bar> = spec
+            .iter()
+            .enumerate()
+            .map(|(i, &(c, v))| Bar {
+                date: day(i),
+                open: c,
+                high: c,
+                low: c,
+                close: c,
+                adj_close: Some(c),
+                volume: v,
+            })
+            .collect();
+        let (samples, kind) =
+            stopped_name_samples("X", &bars, &[], "KOSPI", &MarketContext::default(), day(0));
+        assert_eq!(kind, DelistingKind::Distress);
+        let last = samples.last().expect("samples before the halt");
+        assert_eq!(last.date, day(99));
+        // Scheduled end inside the halt, exit at the first liquidation close.
+        assert_eq!(last.target_end, day(119));
+        assert!((last.forward_returns[HORIZONS.len() - 1] - (40.0 / 199.0 - 1.0)).abs() < 1e-12);
     }
 
     #[test]

@@ -2288,7 +2288,7 @@ fn relabel_stopped_names(
     cache: &RawCache,
     symbols: &[Symbol],
     context: &asterion_model::MarketContext,
-) -> CliResult<()> {
+) -> CliResult<BTreeSet<(String, NaiveDate)>> {
     use asterion_data::krx_delisted::DelistingKind;
     use asterion_model::features::bars_and_extras;
     let (y, m, d) = AUDIT_TEST_FROM;
@@ -2342,8 +2342,9 @@ fn relabel_stopped_names(
         stopped.len(),
         added.len()
     );
+    let keys = added.iter().map(|s| (s.symbol.clone(), s.date)).collect();
     samples.extend(added);
-    Ok(())
+    Ok(keys)
 }
 
 // Index of the 20-session horizon in HORIZONS.
@@ -2353,15 +2354,23 @@ fn run_audits(
     args: &ResearchCvArgs,
     mut panel: asterion_model::research::Panel,
     folds: &[asterion_model::research::Fold],
+    test_only: &BTreeSet<(String, NaiveDate)>,
 ) -> CliResult<ExitCode> {
     use asterion_model::audit::{
-        AUDIT_CANDIDATES, AuditMode, lag_features, previous_session, run_audit,
+        AUDIT_CANDIDATES, AuditMode, Masks, lag_features, previous_session, run_audit,
     };
     use std::io::Write;
     let dir = args.out.parent().unwrap_or(Path::new(".")).to_path_buf();
     fs::create_dir_all(&dir)?;
     let prev = previous_session(&panel);
     let has_prev: Vec<bool> = prev.iter().map(Option::is_some).collect();
+    // Relabelled rows look past their target_end, so they are scored but never trained on.
+    let trainable: Vec<bool> = panel
+        .rows
+        .iter()
+        .map(|r| !test_only.contains(&(r.symbol.clone(), r.date)))
+        .collect();
+    let train_mask = (!test_only.is_empty()).then_some(trainable.as_slice());
     let mut modes = args.audit.clone();
     modes.sort();
     modes.dedup();
@@ -2381,7 +2390,10 @@ fn run_audits(
             folds,
             args.embargo_days,
             mode,
-            keep,
+            Masks {
+                both: keep,
+                train: train_mask,
+            },
             seed,
             &|line| println!("{line}"),
         );
@@ -2487,9 +2499,11 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
     if args.with_delisted {
         samples.extend(load_delisted(&args, &symbols, &context)?);
     }
-    if args.audit_test_delisted {
-        relabel_stopped_names(&mut samples, &cache, &symbols, &context)?;
-    }
+    let relabelled = if args.audit_test_delisted {
+        relabel_stopped_names(&mut samples, &cache, &symbols, &context)?
+    } else {
+        BTreeSet::new()
+    };
     let topics =
         |code: &str, date: NaiveDate| context.disclosures.topic_features(code, date).to_vec();
     let panel = Panel::build_with(
@@ -2519,7 +2533,7 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
         },
     ];
     if !args.audit.is_empty() {
-        return run_audits(&args, panel, &folds);
+        return run_audits(&args, panel, &folds, &relabelled);
     }
     let burnt = if args.report_burnt {
         Some(Fold {
