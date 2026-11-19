@@ -180,6 +180,44 @@ impl Http {
         }
     }
 
+    // Throttled GET of a binary body; 5xx, 429 and network errors are retried like `send`.
+    pub(crate) async fn get_bytes(
+        &mut self,
+        url: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Vec<u8>, DataError> {
+        let max_attempts = self.policy.max_attempts.max(1);
+        let mut backoff = self.policy.initial_backoff;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            self.throttle().await;
+            self.requests_sent += 1;
+            let failure = match self.client.get(url).query(query).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body = resp.bytes().await.map_err(|e| self.network(attempt, e))?;
+                    return Ok(body.to_vec());
+                }
+                Ok(resp) if resp.status().is_server_error() || resp.status().as_u16() == 429 => {
+                    DataError::HttpStatus {
+                        status: resp.status().as_u16(),
+                    }
+                }
+                Ok(resp) => {
+                    return Err(DataError::HttpStatus {
+                        status: resp.status().as_u16(),
+                    });
+                }
+                Err(e) => self.network(attempt, e),
+            };
+            if attempt >= max_attempts {
+                return Err(failure);
+            }
+            sleep(backoff).await;
+            backoff = backoff.saturating_mul(2);
+        }
+    }
+
     fn network(&self, attempts: u32, e: reqwest::Error) -> DataError {
         DataError::Network {
             attempts,

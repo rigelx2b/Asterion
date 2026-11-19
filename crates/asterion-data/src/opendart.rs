@@ -153,6 +153,18 @@ impl DartClient {
         self.http.get(url, &query).await
     }
 
+    // Raw bytes from an OpenDART endpoint that answers with a file; the key is added to `params`.
+    pub async fn get_endpoint_bytes(
+        &mut self,
+        url: &str,
+        params: &[(&str, &str)],
+    ) -> Result<Vec<u8>, DataError> {
+        let mut query = Vec::with_capacity(params.len() + 1);
+        query.push(("crtfc_key", self.key.0.as_str()));
+        query.extend_from_slice(params);
+        self.http.get_bytes(url, &query).await
+    }
+
     // Raw JSON body of one result page for an inclusive receipt-date range.
     pub async fn fetch_page(
         &mut self,

@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use asterion_core::{Market, Symbol};
 use asterion_data::DataError;
+use asterion_data::dart_corp;
 use asterion_data::dart_financials::{self, Period};
 use asterion_data::data_go_kr::{
     ATTRIBUTION, ClientConfig, DataGoKrClient, INDICES, SOURCE_ID, collect_index, collect_symbol,
@@ -113,6 +114,10 @@ enum Command {
     )]
     FetchIndexHistory(FetchIndexHistoryArgs),
     #[command(
+        about = "Download OpenDART corporation code list (corpCode.xml, all companies including delisted) to a local file"
+    )]
+    FetchCorpCodes(FetchCorpCodesArgs),
+    #[command(
         about = "Fetch overseas daily price bars from KIS into raw cache with resumable sync and newest-page refresh"
     )]
     FetchOverseas(FetchOverseasArgs),
@@ -204,6 +209,12 @@ struct FetchHistoryArgs {
         help = "Walk back past empty windows until a bar is found (for delisted stocks; normally stops at first empty)"
     )]
     skip_leading_empty: bool,
+}
+
+#[derive(Debug, Args)]
+struct FetchCorpCodesArgs {
+    #[arg(long, default_value = dart_corp::DEFAULT_PATH, help = "Path of saved corpCode.xml file (replaced on each run)")]
+    out: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -801,6 +812,7 @@ async fn main() -> ExitCode {
             let result = fetch_index_history(args, &mut progress).await;
             finish(progress, result)
         }
+        Command::FetchCorpCodes(args) => fetch_corp_codes(args).await,
         Command::RankScore(args) => rank_score(args),
         Command::ResearchCv(args) => {
             let mut progress = ProgressTracker::start(&dir, "research-cv");
@@ -1587,6 +1599,27 @@ fn rank_fit(args: RankLedgerArgs, progress: &mut ProgressTracker) -> CliResult<E
         "rows={} fingerprint={fp} dir={}",
         panel.rows.len(),
         args.dir.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn fetch_corp_codes(args: FetchCorpCodesArgs) -> CliResult<ExitCode> {
+    let mut client = DartClient::new(
+        DartKey::from_env()?,
+        opendart::ENDPOINT,
+        RetryPolicy::default(),
+    )?;
+    let xml = dart_corp::fetch_xml(&mut client, dart_corp::URL).await?;
+    let entries = dart_corp::parse(&xml);
+    if entries.is_empty() {
+        return Err("downloaded corp code list is empty; nothing saved".into());
+    }
+    dart_corp::save(&args.out, &xml)?;
+    let listed = entries.iter().filter(|e| !e.stock_code.is_empty()).count();
+    println!(
+        "fetch_corp_codes_done entries={} with_stock_code={listed} out={}",
+        entries.len(),
+        args.out.display()
     );
     Ok(ExitCode::SUCCESS)
 }
