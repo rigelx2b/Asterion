@@ -164,6 +164,14 @@ Asterion은 한국 주식(KOSPI/KOSDAQ)의 미래 가격 및 수익률을 1, 3, 
 - **통제 실험 설계**: 백필을 적용하지 않은 동일 조건의 대조 실행(동일 명령, 이력 미병합, `2022`/`2023`/`2024` 폴드, `30`일 embargo, `55`개 피처)과 비교했다. 패널 행 수(`1,647,640`)와 `volatility_20`만 사용하는 `control_lowvol`은 완전히 동일하며, `fund_*` 피처를 사용하는 `composite6`은 수치가 달라질 수 있다.
 - **결과·판정**: 통합(pooled) 기준(수정 전 → 수정 후) `gbdt` `IC`는 `h5` `0.1375` → `0.1385`, `h10` `0.1590` → `0.1600`, `h20` `0.1886` → `0.1892`, `ridge` `IC`는 `h20` `0.1887` → `0.1893`을 기록했다. 대조군 대비 증분 초과수익(incremental excess)은 `gbdt` `h20` `+5.9%`(`t` `1.37`) → `+6.0%`(`t` `1.46`), `ridge` `h20` `+4.9%`(`t` `1.30`) → `+4.8%`(`t` `1.31`), `composite6` `h20` `+3.6%`(`t` `0.80`) → `+3.9%`(`t` `0.84`)였다. 모든 후보 모델이 여전히 `passed=false`이며, 수정 후 `IC`가 하락하지 않고 최대 `0.001` 상승하는 데 그쳐 결손 데이터가 기존 보고 `IC`를 부풀렸다는 가설은 지지되지 않으며 차이는 노이즈 범위 내에 있다. 본 절에 앞서 기록된 CV 수치는 백필 미적용 상태에서 산출된 값이다.
 
+#### 2015–2019 상장폐지 종목 편입 (`research-cv --with-delisted`, 2026-11-19)
+
+- **데이터 수집**: KRX KIND 상장폐지현황 내보내기(`data/raw/krx_delisted`, `2010–2019` 기간 KOSPI `170`행 + KOSDAQ `329`행)에서 `2015-01-01` 이후 상장폐지되었고 `kr-union`에 포함되지 않은 `157`개 종목을 선별해 `config/universe/kr-delisted-2015-2019.txt`로 구성했다(`14`개 중복 코드 제외: KOSDAQ→KOSPI 이전 상장 및 재사용 코드이며 `"유가증권시장 상장"` 사유는 건너뜀). 해당 `157`종목의 KIS 과거 일봉은 이미 수집 완료(`fetch-history --skip-leading-empty`, `data/raw/kis_daily_delisted`)되었으며, `fetch-dart-backfill`로 `data/raw/opendart_backfill/delisted2015`에 공시·주요 재무를 백필했다(`157/157`개 `corp_code` 매핑 완료, `2,640`회 요청, 실패 `0`건; `157`종목 공시 `17,573`건, `104`종목 주요 재무 보고서 확보 — 나머지는 SPAC·선박투자회사·REITs). 신규 옵션 `fetch-dart-backfill --shares-to-year 2019`로 OpenDART `stockTotqySttus`의 보고서 기준일별 발행 보통주 수를 수집해(`3,130`회 요청, 실패 `0`건, 주식 수 보유 기간 `1,558`개) 학습 행 시가총액을 `미수정 종가 × 해당 일자 이하 최신 보고서 발행 주식 수`(최초 보고서 이전 일자는 최초 보고서 적용)로 산출했으며, `17`종목은 주식 수 데이터가 없다.
+- **라벨 규칙**: `36`개 고유 상장폐지 사유에 대해 순서 기반 규칙(ordered rules)을 적용해 매칭되지 않는 사유가 있으면 실패 처리한다. 부실·재무·영업 사유(`66`종목: 감사의견 거절·부적정·한정, 자본잠식, 부도, 상장적격성 실질심사(계속성·투명성), 매출액·시가총액 미달, `5`년 연속 영업손실, 정기보고서 미제출)는 종가치(terminal value) `0`(`-100%`)으로, 그 외 사유(`91`종목: 합병, 지주회사 완전자회사 편입, 자진상장폐지, SPAC 상장예비심사 청구 기한 초과, 펀드·선박투자회사 해산·만기)는 최종 거래 종가로 청산 처리했다. KIS 일봉에서 말미 거래량 `0` 구간 또는 `3`거래일 이상 연속 거래량 `0` 구간 직후의 말미 `15`거래일 이하 거래 구간을 최종 거래정지 및 정리매매 창구로 탐지하고, 상장폐지가 공개된 시점 이후를 배제하기 위해 최종 거래정지 이전 일자에서만 샘플을 생성했다(`9,962`개 거래정지·정리매매 세션 제외). 마지막 봉을 넘어서는 지평(horizon)은 종가치로 종료되고 최종 거래정지 내부에서 종료되는 지평은 다음 거래 종가(정리매매 종가) 또는 종가치로 종료되며, `0.6–1.6` 일일 급등락 필터는 최종 거래정지 이후 구간에 적용하지 않는다. 유동성 필터 이전 샘플은 `72,110`개(이 중 `h20`이 종가치로 종료되는 샘플 `1,714`개)이고, 패널 행 수는 `2,685,552`에서 `2,707,936`(`+22,384`, 모두 `2015–2019` 학습 행)으로 증가했다.
+- **통제 실험 설계**: 직전 `--with-history --with-index-history` 실행과 동일한 명령(`kr-union`, `2022`/`2023`/`2024` 테스트 폴드, `30`일 embargo, `55`개 피처)에 `--with-delisted`와 `--dart-backfill-root data/raw/opendart_backfill/delisted2015`를 추가해 비교했다. 테스트 행은 변하지 않아 `control_lowvol`과 `composite6` 수치가 모든 윈도우에서 완전히 동일하며, 유니버스 과거 일봉 접합 종목 수도 `2,212`개로 동일하다.
+- **결과·판정**: 통합(pooled) 기준(편입 전 → 편입 후) `gbdt` `IC`는 `h5` `0.1401` → `0.1400`, `h10` `0.1623` → `0.1618`, `h20` `0.1944` → `0.1945`, `ridge` `IC`는 `h20` `0.1883` → `0.1884`였다. 대조군 대비 증분 초과수익(incremental excess)은 `gbdt` `h5` `+2.1%`(`t` `0.38`) → `+3.0%`(`t` `0.55`), `h10` `+4.4%`(`t` `0.95`) → `+4.1%`(`t` `0.89`), `h20` `+6.0%`(`t` `1.33`) → `+6.3%`(`t` `1.43`), `ridge` `h20` `+3.3%`(`t` `0.84`) → `+3.2%`(`t` `0.83`), `gbdt_dart` `h20` `+5.3%`(`t` `1.18`) → `+6.3%`(`t` `1.43`)였다. 모든 후보 모델이 여전히 `passed=false`이고 모든 증분 `t < 1.5`로 측정 가능한 이득은 없으며 차이는 노이즈 범위 내에 있다(편입 행 비중이 전체 패널의 약 `0.8%`이고 학습 폴드만 변경되므로 작은 영향이 예상되었다).
+- **한계**: `2015`년 이전 상장폐지 종목과 KIS 일봉이 없는 종목은 포함되지 않았으며, `2017–2019`년 상장폐지 행의 비영(nonzero) `fund_available` 비율은 `0.56–0.61`로 일반 유니버스(`0.84`) 대비 낮아(SPAC·펀드는 재무제표 없음) 잔존 결측 차이가 남아 있다. 발행 주식 수 조회가 `2015` 사업연도부터 시작해 최조기 행은 이후 보고서를 사용하며, 부실 사유 종가치 `0` 처리는 장외(OTC) 잔존 가치를 반영하지 않고, forward paper ledger arm들은 재학습(refit)하지 않았다.
+
 ### Forward Paper Ledger
 
 - `rank-fit`을 통해 1,646,883개 라벨 행으로 학습된 4개 랭킹 arm을 지문(fingerprinted)과 함께 동결하고 paper hypothesis로 등록했다.
@@ -208,6 +216,12 @@ asterion fetch-corp-codes
 # 시장 구분 피드에서 누락된 유니버스 종목의 기업별 공시·주요 재무 백필 수집 (이후 연구 명령에 --dart-backfill-root data/raw/opendart_backfill/universe 전달)
 asterion fetch-dart-backfill --universe config/universe/kr-union.txt --root data/raw/opendart_backfill/universe
 
+# 2015–2019년 상장폐지 종목의 OpenDART 공시·주요 재무·발행 주식 수(2019년까지) 백필 수집
+asterion fetch-dart-backfill --universe config/universe/kr-delisted-2015-2019.txt --root data/raw/opendart_backfill/delisted2015 --shares-to-year 2019
+
+# 2015–2019년 상장폐지 종목을 학습 행에 포함한 walk-forward CV 실행 (--with-history 필수)
+asterion research-cv --universe config/universe/kr-union.txt --with-history --with-index-history --with-delisted --dart-backfill-root data/raw/opendart_backfill/delisted2015 --out data/ledger/cv_2026-11-19-delisted/report.json
+
 # OpenDART 재무제표 수집
 asterion fetch-financials
 
@@ -225,7 +239,7 @@ asterion monitor
 
 ## 7. 다음 할 일
 
-1. 유니버스가 `2020+` 상장 종목 기반으로 구성되어 생존 편향이 남아 있으므로, `2020`년 이전 유니버스에 `2020`년 이전 상장폐지 종목을 추가해 보완(KIS `2020`년 이전 KOSPI/KOSDAQ 지수 수집은 `2026-11-19` 완료, 측정 가능한 이득 없음; `5`절 참조). 현재 상장폐지 종목의 OpenDART 데이터는 `fetch-dart-backfill`로 수집 가능하며 `2015–2019`년 상장폐지 `157`종목의 KIS 일봉(`data/raw/kis_daily_delisted`)도 수집 완료되었으므로, 상장폐지 수익률 규칙(delisting-return rule)과 함께 학습 유니버스에 편입하는 작업만 남아 있다.
+1. **완료 (2026-11-19)**: `research-cv --with-delisted`로 `2015–2019`년 상장폐지 `157`종목을 학습에 편입해 생존 편향 보완 완료(부실 사유 `-100%`, 그 외 최종 거래 종가 청산; 측정 가능한 개선 없음, `5`절 참조). 잔여 과제: `2015`년 이전 상장폐지 종목은 미포함 상태이며, `--with-delisted`를 기본 연구 설정에 포함할지 여부는 미정이다.
 2. 저장 공간 확보 후 Arctic Shift 덤프 파일을 통한 Reddit 과거 이력 적재(최근 일자는 기존 API 유지).
 3. **완료 (2026-11-19)**: 2010–2020 KIS 과거 일봉·OpenDART 재무제표를 피처에 반영해 purged walk-forward CV 재실행 완료(전 후보 미통과, 측정 가능한 개선 없음; 5절 `--with-history` 결과 참조).
 4. Forward paper ledger 채점을 지속하며, 비용 차감 후 표본 외에서 유의미한 성능이 확인될 때만 우위(edge)를 인정.
