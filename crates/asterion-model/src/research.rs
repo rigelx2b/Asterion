@@ -220,6 +220,8 @@ pub enum Candidate {
     Gbdt,
     // Trial 4 (addendum_dart_topics.json): gbdt on base plus title-topic columns.
     GbdtDart,
+    // Trial 5 (README pre-registration): gbdt on base plus investor-flow columns.
+    GbdtFlow,
 }
 
 impl Candidate {
@@ -245,8 +247,36 @@ impl Candidate {
             Candidate::Ridge => "ridge",
             Candidate::Gbdt => "gbdt",
             Candidate::GbdtDart => "gbdt_dart",
+            Candidate::GbdtFlow => "gbdt_flow",
         }
     }
+
+    /// Candidates a panel supports: `GbdtFlow` only when it carries flow columns.
+    pub fn for_panel(panel: &Panel) -> Vec<Candidate> {
+        let mut out = Candidate::ALL.to_vec();
+        if !flow_columns(panel).is_empty() {
+            out.push(Candidate::GbdtFlow);
+        }
+        out
+    }
+}
+
+/// Name prefix of the investor-flow columns appended after the title-topic columns.
+pub const FLOW_PREFIX: &str = "flow_";
+
+/// Panel columns of the investor-flow features.
+pub fn flow_columns(panel: &Panel) -> Vec<usize> {
+    (0..panel.names.len())
+        .filter(|&j| panel.names[j].starts_with(FLOW_PREFIX))
+        .collect()
+}
+
+/// Columns before the first flow column (base plus title topics).
+fn pre_flow_width(panel: &Panel) -> usize {
+    flow_columns(panel)
+        .first()
+        .copied()
+        .unwrap_or(panel.names.len())
 }
 
 /// A fitted score; fixed-rule candidates carry their weights as a linear model.
@@ -291,9 +321,19 @@ pub fn fit(candidate: Candidate, panel: &Panel, train: &[usize], k: usize) -> Sc
             panel,
             train,
             k,
-            panel.names.len(),
+            pre_flow_width(panel),
             &GbdtParams::default(),
         )),
+        Candidate::GbdtFlow => {
+            let cols: Vec<usize> = (0..p).chain(flow_columns(panel)).collect();
+            Scorer::Trees(Gbdt::fit_columns(
+                panel,
+                train,
+                k,
+                &cols,
+                &GbdtParams::default(),
+            ))
+        }
     }
 }
 
@@ -435,6 +475,9 @@ pub enum Node {
 pub struct Gbdt {
     pub base: f64,
     pub trees: Vec<Vec<Node>>,
+    // Panel columns the trees index into, in order; `None` means the leading columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<Vec<usize>>,
 }
 
 pub fn bin_of(v: f32) -> u8 {
@@ -473,7 +516,10 @@ fn tree_predict(tree: &[Node], bins: &[u8]) -> f64 {
 
 impl Gbdt {
     pub fn predict(&self, x: &[f32]) -> f64 {
-        let bins: Vec<u8> = x.iter().map(|v| bin_of(*v)).collect();
+        let bins: Vec<u8> = match &self.cols {
+            Some(cols) => cols.iter().map(|&j| bin_of(x[j])).collect(),
+            None => x.iter().map(|v| bin_of(*v)).collect(),
+        };
         self.base
             + self
                 .trees
@@ -483,11 +529,27 @@ impl Gbdt {
     }
 
     pub fn fit(panel: &Panel, train: &[usize], k: usize, p: usize, params: &GbdtParams) -> Gbdt {
+        let cols: Vec<usize> = (0..p).collect();
+        let mut g = Self::fit_columns(panel, train, k, &cols, params);
+        g.cols = None;
+        g
+    }
+
+    /// Fits on the given panel columns only; predictions read the same columns.
+    pub fn fit_columns(
+        panel: &Panel,
+        train: &[usize],
+        k: usize,
+        cols: &[usize],
+        params: &GbdtParams,
+    ) -> Gbdt {
+        let p = cols.len();
         let n = train.len();
         let mut bins = vec![0u8; n * p];
         for (r, &i) in train.iter().enumerate() {
-            for (c, v) in panel.rows[i].x.iter().take(p).enumerate() {
-                bins[r * p + c] = bin_of(*v);
+            let x = &panel.rows[i].x;
+            for (c, &j) in cols.iter().enumerate() {
+                bins[r * p + c] = bin_of(x[j]);
             }
         }
         let y: Vec<f64> = train
@@ -515,7 +577,11 @@ impl Gbdt {
             }
             trees.push(tree);
         }
-        Gbdt { base, trees }
+        Gbdt {
+            base,
+            trees,
+            cols: Some(cols.to_vec()),
+        }
     }
 }
 
@@ -863,6 +929,8 @@ pub struct CvReport {
 pub const MIN_INCREMENT_T: f64 = 2.4;
 // Bonferroni threshold once the title-topic trial makes four.
 pub const ADDENDUM_MIN_T: f64 = 2.5;
+// Pre-registered threshold for the fifth trial (investor flows vs gbdt).
+pub const FLOW_MIN_T: f64 = 2.6;
 
 struct Run {
     ics: Vec<(NaiveDate, f64)>,
@@ -871,7 +939,7 @@ struct Run {
 
 fn run_fold(panel: &Panel, fold: Fold, embargo: u64, k: usize, log: &dyn Fn(&str)) -> Vec<Run> {
     let (train, test) = split(panel, fold, embargo);
-    Candidate::ALL
+    Candidate::for_panel(panel)
         .iter()
         .map(|&c| {
             let scorer = fit(c, panel, &train, k);
@@ -907,13 +975,14 @@ pub fn run_cv(
     let mut dev = Vec::new();
     let mut burnt_out = Vec::new();
     let mut verdicts = Vec::new();
+    let candidates = Candidate::for_panel(panel);
     for (k, &h_idx) in CV_HORIZONS.iter().enumerate() {
         let horizon = HORIZONS[h_idx];
         let per_fold: Vec<Vec<Run>> = folds
             .iter()
             .map(|&f| run_fold(panel, f, embargo, k, log))
             .collect();
-        for (ci, c) in Candidate::ALL.iter().enumerate() {
+        for (ci, c) in candidates.iter().enumerate() {
             let mut ics = Vec::new();
             let mut recs = Vec::new();
             let mut ctrl = Vec::new();
@@ -950,16 +1019,22 @@ pub fn run_cv(
                 });
             }
             dev.push(pooled);
-            // Addendum: the title-topic trial is judged against gbdt, not the control.
-            if *c == Candidate::GbdtDart {
-                let gi = Candidate::ALL
+            // Addenda: the title-topic and flow trials are judged against gbdt.
+            if matches!(c, Candidate::GbdtDart | Candidate::GbdtFlow) {
+                let vs = format!("{}_vs_gbdt", c.id());
+                let min_t = if *c == Candidate::GbdtFlow {
+                    FLOW_MIN_T
+                } else {
+                    ADDENDUM_MIN_T
+                };
+                let gi = candidates
                     .iter()
                     .position(|x| *x == Candidate::Gbdt)
                     .unwrap_or(0);
                 let (mut recs, mut base, mut pos) = (Vec::new(), Vec::new(), 0);
                 for (f, runs) in folds.iter().zip(&per_fold) {
                     let s = summarize(
-                        "gbdt_dart_vs_gbdt",
+                        &vs,
                         horizon,
                         &f.test_from.to_string(),
                         &runs[ci].ics,
@@ -971,16 +1046,16 @@ pub fn run_cv(
                     recs.extend(runs[ci].records.iter().copied());
                     base.extend(runs[gi].records.iter().copied());
                 }
-                let pooled = summarize("gbdt_dart_vs_gbdt", horizon, "pooled", &ics, &recs, &base);
+                let pooled = summarize(&vs, horizon, "pooled", &ics, &recs, &base);
                 if k == PRIMARY {
                     verdicts.push(Verdict {
-                        candidate: "gbdt_dart_vs_gbdt".to_owned(),
+                        candidate: vs.clone(),
                         increment_annual: pooled.increment_annual,
                         increment_t: pooled.increment_t,
                         ic_positive_every_fold: ic_ok,
                         excess_positive_folds: pos,
                         passed: pooled.increment_annual > 0.0
-                            && pooled.increment_t >= ADDENDUM_MIN_T
+                            && pooled.increment_t >= min_t
                             && pos >= 2,
                     });
                 }
@@ -989,7 +1064,7 @@ pub fn run_cv(
         }
         if let Some(b) = burnt {
             let runs = run_fold(panel, b, embargo, k, log);
-            for (ci, c) in Candidate::ALL.iter().enumerate() {
+            for (ci, c) in candidates.iter().enumerate() {
                 burnt_out.push(summarize(
                     c.id(),
                     horizon,

@@ -145,6 +145,15 @@ impl KisClient {
         self.http.requests_sent()
     }
 
+    /// A second client on this client's token (issued now if needed), with its own
+    /// throttle; KIS limits how often tokens may be issued, not how many share one.
+    pub async fn fork(&mut self, policy: RetryPolicy) -> Result<Self, DataError> {
+        let token = self.token().await?;
+        let mut other = KisClient::new(self.keys.clone(), &self.base, policy)?;
+        other.token = Some(token);
+        Ok(other)
+    }
+
     fn scrub(&self, text: &str) -> String {
         let text = redact_secret(text, &self.keys.app_secret);
         let text = redact_secret(&text, &self.keys.app_key);

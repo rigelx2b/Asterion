@@ -295,9 +295,6 @@ struct FetchInvestorHistoryArgs {
 
     #[arg(long, default_value = kis::INVESTOR_DAILY_ROOT, help = "Directory for raw KIS per-stock daily investor flow responses")]
     root: PathBuf,
-
-    #[arg(long, help = "Stop after sending this many API requests")]
-    max_requests: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -471,6 +468,20 @@ struct ResearchCvArgs {
         help = "Relabel 2022+ rows for delisted names using tail-inferred halt/liquidation exits instead of stale halted closes (applies only with --audit)"
     )]
     audit_test_delisted: bool,
+
+    #[arg(
+        long,
+        conflicts_with = "with_history",
+        help = "Append 5/20-session foreign and institution net-buy flow features and add the gbdt_flow arm against gbdt (incompatible with --with-history)"
+    )]
+    with_flows: bool,
+
+    #[arg(
+        long,
+        default_value = kis::INVESTOR_DAILY_ROOT,
+        help = "Directory of cached KIS per-stock daily investor flow responses (read only with --with-flows)"
+    )]
+    flow_root: PathBuf,
 
     #[arg(
         long,
@@ -2026,6 +2037,39 @@ async fn fetch_dart_backfill(
 // KIS sector codes for the two broad boards, in the order (KOSPI, KOSDAQ).
 const KIS_INDEX_CODES: [&str; 2] = ["0001", "1001"];
 
+// One worker's share of fetch-investor-history: (requests, rows, failures).
+async fn investor_worker(
+    client: &mut KisClient,
+    symbols: &[&Symbol],
+    root: &Path,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<(usize, usize, u32), DataError> {
+    let (mut requests, mut rows, mut failures) = (0usize, 0usize, 0u32);
+    for symbol in symbols {
+        let code = symbol.code();
+        match kis::collect_investor_daily(client, root, code, from, to).await {
+            Ok((r, n)) => {
+                requests += r;
+                rows += n;
+                println!("{code} requests={r} rows={n}");
+            }
+            Err(
+                e @ (DataError::HttpStatus { status: 401 | 403 } | DataError::MissingServiceKey(_)),
+            ) => return Err(e),
+            Err(e) => {
+                failures += 1;
+                eprintln!("{code} error={e}");
+            }
+        }
+    }
+    Ok((requests, rows, failures))
+}
+
+// Concurrent workers on one token; each request is latency-bound, so three stay
+// under the 20 requests per second limit.
+const INVESTOR_WORKERS: usize = 3;
+
 async fn fetch_investor_history(
     args: FetchInvestorHistoryArgs,
     progress: &mut ProgressTracker,
@@ -2036,36 +2080,32 @@ async fn fetch_investor_history(
         min_interval: kis::MIN_INTERVAL,
         ..RetryPolicy::default()
     };
-    let mut client = KisClient::new(KisKeys::from_env()?, kis::BASE_URL, policy)?;
-    let (mut failures, mut rows, mut requests) = (0u32, 0usize, 0usize);
+    let mut c0 = KisClient::new(KisKeys::from_env()?, kis::BASE_URL, policy)?;
+    let mut c1 = c0.fork(policy).await?;
+    let mut c2 = c0.fork(policy).await?;
+    let shard = |w: usize| -> Vec<&Symbol> {
+        symbols
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % INVESTOR_WORKERS == w)
+            .map(|(_, s)| s)
+            .collect()
+    };
+    let (s0, s1, s2) = (shard(0), shard(1), shard(2));
     progress.stage("fetching", symbols.len() as u64);
-    for (i, symbol) in symbols.iter().enumerate() {
-        if args
-            .max_requests
-            .is_some_and(|m| client.requests_sent() >= m)
-        {
-            break;
-        }
-        let code = symbol.code();
-        progress.current(code);
-        match kis::collect_investor_daily(&mut client, &args.root, code, args.from, args.to).await {
-            Ok((r, n)) => {
-                requests += r;
-                rows += n;
-                println!("{code} requests={r} rows={n}");
-            }
-            Err(
-                e @ (DataError::HttpStatus { status: 401 | 403 } | DataError::MissingServiceKey(_)),
-            ) => {
-                return Err(e.into());
-            }
-            Err(e) => {
-                failures += 1;
-                eprintln!("{code} error={e}");
-            }
-        }
-        progress.advance(i as u64 + 1);
+    let (a, b, c) = tokio::join!(
+        investor_worker(&mut c0, &s0, &args.root, args.from, args.to),
+        investor_worker(&mut c1, &s1, &args.root, args.from, args.to),
+        investor_worker(&mut c2, &s2, &args.root, args.from, args.to),
+    );
+    let (mut requests, mut rows, mut failures) = (0usize, 0usize, 0u32);
+    for r in [a, b, c] {
+        let (q, n, f) = r?;
+        requests += q;
+        rows += n;
+        failures += f;
     }
+    progress.advance(symbols.len() as u64);
     println!("fetch_investor_history_done requests={requests} rows={rows} failures={failures}");
     Ok(if failures == 0 {
         ExitCode::SUCCESS
@@ -2413,6 +2453,61 @@ fn load_delisted(
     Ok(samples)
 }
 
+// Flow coverage is checked from this date (the first data.go.kr year).
+const FLOW_COVERAGE_FROM: (i32, u32, u32) = (2020, 2, 1);
+
+// Loads cached investor flows and prints liquid-row coverage, overall and for names whose
+// bars stop before the data end (missing flows must not mark later delistings).
+fn load_flows(
+    root: &Path,
+    symbols: &[Symbol],
+    samples: &[asterion_model::features::Sample],
+) -> CliResult<asterion_model::flows::FlowIndex> {
+    let mut index = asterion_model::flows::FlowIndex::default();
+    for symbol in symbols {
+        let days = kis::load_investor_daily(root, symbol.code())?;
+        if !days.is_empty() {
+            index.insert(symbol.code(), &days);
+        }
+    }
+    let (y, m, d) = FLOW_COVERAGE_FROM;
+    let from = NaiveDate::from_ymd_opt(y, m, d).ok_or("invalid coverage date")?;
+    let data_end = samples
+        .iter()
+        .map(|s| s.target_end)
+        .max()
+        .ok_or("no samples")?;
+    let cutoff = data_end
+        .checked_sub_days(chrono::Days::new(STOPPED_SLACK_DAYS))
+        .ok_or("invalid cutoff")?;
+    let mut last: BTreeMap<&str, NaiveDate> = BTreeMap::new();
+    for s in samples {
+        let e = last.entry(s.symbol.as_str()).or_insert(s.date);
+        *e = (*e).max(s.target_end);
+    }
+    let (mut n, mut hit, mut sn, mut shit) = (0usize, 0usize, 0usize, 0usize);
+    for s in samples
+        .iter()
+        .filter(|s| s.date >= from && asterion_model::confidence::liquid(s))
+    {
+        let covered = usize::from(index.covers(&s.symbol, s.date));
+        n += 1;
+        hit += covered;
+        if last.get(s.symbol.as_str()).is_some_and(|d| *d < cutoff) {
+            sn += 1;
+            shit += covered;
+        }
+    }
+    let share = |a: usize, b: usize| a as f64 / b.max(1) as f64;
+    println!(
+        "flows codes={} liquid_rows_from={from} rows={n} covered={:.4} stopped_rows={sn} stopped_covered={:.4}",
+        index.len(),
+        share(hit, n),
+        share(shit, sn)
+    );
+    Ok(index)
+}
+
 // First test-fold date; audit relabelling touches rows from here on only.
 const AUDIT_TEST_FROM: (i32, u32, u32) = (2022, 1, 1);
 // A name whose last bar is this many days before the data end has stopped trading.
@@ -2643,13 +2738,25 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
     } else {
         BTreeSet::new()
     };
-    let topics =
-        |code: &str, date: NaiveDate| context.disclosures.topic_features(code, date).to_vec();
-    let panel = Panel::build_with(
-        samples,
-        &asterion_model::disclosures::TOPIC_FEATURE_NAMES,
-        &topics,
-    );
+    let flows = if args.with_flows {
+        load_flows(&args.flow_root, &symbols, &samples)?
+    } else {
+        asterion_model::flows::FlowIndex::default()
+    };
+    let mut extra_names: Vec<&'static str> =
+        asterion_model::disclosures::TOPIC_FEATURE_NAMES.to_vec();
+    if args.with_flows {
+        extra_names.extend_from_slice(&asterion_model::flows::FLOW_FEATURE_NAMES);
+    }
+    let with_flows = args.with_flows;
+    let extras = |code: &str, date: NaiveDate| {
+        let mut v = context.disclosures.topic_features(code, date).to_vec();
+        if with_flows {
+            v.extend_from_slice(&flows.features(code, date));
+        }
+        v
+    };
+    let panel = Panel::build_with(samples, &extra_names, &extras);
     println!(
         "symbols_loaded={loaded} panel_rows={} dates={} features={}",
         panel.rows.len(),
