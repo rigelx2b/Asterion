@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 asterion-core = { version = "0.1.0", path = "../asterion-core" }
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "std", "clock"] }
+encoding_rs = "0.8.44"
 percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", features = ["query", "native-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }

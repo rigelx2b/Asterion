@@ -10,6 +10,7 @@ pub mod error;
 pub mod fred;
 mod http;
 pub mod kis;
+pub mod krx_delisted;
 pub mod opendart;
 pub mod progress;
 pub mod redact;

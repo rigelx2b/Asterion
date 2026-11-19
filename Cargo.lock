@@ -111,6 +111,7 @@ version = "0.1.0"
 dependencies = [
  "asterion-core",
  "chrono",
+ "encoding_rs",
  "percent-encoding",
  "reqwest",
  "serde",
