@@ -2066,8 +2066,8 @@ async fn investor_worker(
     Ok((requests, rows, failures))
 }
 
-// Concurrent workers on one token; each request is latency-bound, so three stay
-// under the 20 requests per second limit.
+// Concurrent workers on one token; each request is latency-bound, so three are faster
+// than one while their combined throttle stays under the 20 requests per second limit.
 const INVESTOR_WORKERS: usize = 3;
 
 async fn fetch_investor_history(
@@ -2077,7 +2077,8 @@ async fn fetch_investor_history(
     let cache = RawCache::new(&args.universe.cache_dir);
     let symbols = resolve_symbols(&args.universe, &cache)?;
     let policy = RetryPolicy {
-        min_interval: kis::MIN_INTERVAL,
+        // Each worker waits the account-wide interval times the worker count.
+        min_interval: kis::MIN_INTERVAL * INVESTOR_WORKERS as u32,
         ..RetryPolicy::default()
     };
     let mut c0 = KisClient::new(KisKeys::from_env()?, kis::BASE_URL, policy)?;
