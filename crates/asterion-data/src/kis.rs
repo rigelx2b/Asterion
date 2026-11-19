@@ -30,6 +30,13 @@ const BACKEND_BUSY_CODE: &str = "OPSQ0008";
 const BUSY_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 const CHART_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice";
 const CHART_TR_ID: &str = "FHKST03010100";
+const INDEX_CHART_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice";
+const INDEX_CHART_TR_ID: &str = "FHKUP03500100";
+pub const INDEX_HISTORY_ROOT: &str = "data/raw/kis_index";
+// The index chart returns at most this many rows per call, newest first.
+const INDEX_PAGE_CAP: usize = 50;
+// Calendar days per index request; at most 44 sessions, under the 50-row cap.
+const INDEX_WINDOW_DAYS: u64 = 60;
 pub const HISTORY_ROOT: &str = "data/raw/kis_daily";
 const OVERSEAS_PATH: &str = "/uapi/overseas-price/v1/quotations/dailyprice";
 const OVERSEAS_TR_ID: &str = "HHDFS76240000";
@@ -220,29 +227,61 @@ impl KisClient {
         to: NaiveDate,
         adjusted: &str,
     ) -> Result<String, DataError> {
-        let token = self.token().await?;
-        let url = format!("{}{CHART_PATH}", self.base);
-        let auth = format!("Bearer {token}");
         let d1 = from.format("%Y%m%d").to_string();
         let d2 = to.format("%Y%m%d").to_string();
+        let query = [
+            ("FID_COND_MRKT_DIV_CODE", "J"),
+            ("FID_INPUT_ISCD", code),
+            ("FID_INPUT_DATE_1", d1.as_str()),
+            ("FID_INPUT_DATE_2", d2.as_str()),
+            ("FID_PERIOD_DIV_CODE", "D"),
+            ("FID_ORG_ADJ_PRC", adjusted),
+        ];
+        self.fetch_daily(CHART_PATH, CHART_TR_ID, &query).await
+    }
+
+    /// Raw JSON body of daily index levels for one KIS sector code (`0001` KOSPI,
+    /// `1001` KOSDAQ) between two dates, inclusive.
+    pub async fn fetch_index_chart(
+        &mut self,
+        code: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<String, DataError> {
+        let d1 = from.format("%Y%m%d").to_string();
+        let d2 = to.format("%Y%m%d").to_string();
+        let query = [
+            ("FID_COND_MRKT_DIV_CODE", "U"),
+            ("FID_INPUT_ISCD", code),
+            ("FID_INPUT_DATE_1", d1.as_str()),
+            ("FID_INPUT_DATE_2", d2.as_str()),
+            ("FID_PERIOD_DIV_CODE", "D"),
+        ];
+        self.fetch_daily(INDEX_CHART_PATH, INDEX_CHART_TR_ID, &query)
+            .await
+    }
+
+    // Shared GET for the daily chart endpoints, retrying rate-limit and busy-backend replies.
+    async fn fetch_daily(
+        &mut self,
+        path: &str,
+        tr_id: &str,
+        query: &[(&str, &str)],
+    ) -> Result<String, DataError> {
+        let token = self.token().await?;
+        let url = format!("{}{path}", self.base);
+        let auth = format!("Bearer {token}");
         for attempt in 0..=BUSY_BACKOFF_SECS.len() {
             let text = self
                 .http
                 .send(|c| {
                     c.get(&url)
-                        .query(&[
-                            ("FID_COND_MRKT_DIV_CODE", "J"),
-                            ("FID_INPUT_ISCD", code),
-                            ("FID_INPUT_DATE_1", d1.as_str()),
-                            ("FID_INPUT_DATE_2", d2.as_str()),
-                            ("FID_PERIOD_DIV_CODE", "D"),
-                            ("FID_ORG_ADJ_PRC", adjusted),
-                        ])
+                        .query(query)
                         .header("content-type", "application/json; charset=utf-8")
                         .header("authorization", &auth)
                         .header("appkey", &self.keys.app_key)
                         .header("appsecret", &self.keys.app_secret)
-                        .header("tr_id", CHART_TR_ID)
+                        .header("tr_id", tr_id)
                         .header("custtype", "P")
                 })
                 .await?;
@@ -522,6 +561,105 @@ pub async fn collect_history(
     Ok((requests, rows))
 }
 
+pub fn parse_index_chart(body: &str) -> Result<Vec<ChartBar>, DataError> {
+    let env: ChartEnvelope = serde_json::from_str(body)?;
+    let mut out = Vec::new();
+    for row in &env.output2 {
+        let raw_date = row
+            .get("stck_bsop_date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if raw_date.is_empty() {
+            continue;
+        }
+        let date =
+            NaiveDate::parse_from_str(raw_date, "%Y%m%d").map_err(|_| DataError::InvalidField {
+                field: "stck_bsop_date",
+                value: raw_date.to_owned(),
+            })?;
+        out.push(ChartBar {
+            date,
+            open: number(row, "bstp_nmix_oprc")?,
+            high: number(row, "bstp_nmix_hgpr")?,
+            low: number(row, "bstp_nmix_lwpr")?,
+            close: number(row, "bstp_nmix_prpr")?,
+            volume: number(row, "acml_vol")?,
+            trading_value: number(row, "acml_tr_pbmn")?,
+        });
+    }
+    out.sort_by_key(|b| b.date);
+    out.dedup_by_key(|b| b.date);
+    Ok(out)
+}
+
+/// Raw index chart bodies live at `<root>/<code>/<from>_<to>.json`.
+pub fn index_chart_path(root: &Path, code: &str, from: NaiveDate, to: NaiveDate) -> PathBuf {
+    root.join(code).join(format!("{from}_{to}.json"))
+}
+
+/// Walks back from `to` to `from` in fixed windows, storing each body once. A window that
+/// fills the page cap may be truncated, so it is rejected instead of cached.
+/// Returns (new requests, total rows seen).
+pub async fn collect_index_history(
+    client: &mut KisClient,
+    root: &Path,
+    code: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<(usize, usize), DataError> {
+    let (mut requests, mut rows) = (0, 0);
+    let mut end = to;
+    while end >= from {
+        let start = end
+            .checked_sub_days(chrono::Days::new(INDEX_WINDOW_DAYS - 1))
+            .map_or(from, |d| d.max(from));
+        let path = index_chart_path(root, code, start, end);
+        let n = if path.exists() {
+            let body = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+            parse_index_chart(&body)?.len()
+        } else {
+            let body = client.fetch_index_chart(code, start, end).await?;
+            requests += 1;
+            let n = parse_index_chart(&body)?.len();
+            if n >= INDEX_PAGE_CAP {
+                return Err(DataError::InvalidField {
+                    field: "output2",
+                    value: format!("{code} {start}..{end} returned {n} rows (page cap)"),
+                });
+            }
+            let dir = path.parent().expect("index path has a parent");
+            fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, &body).map_err(|e| io(&tmp, e))?;
+            fs::rename(&tmp, &path).map_err(|e| io(&path, e))?;
+            n
+        };
+        rows += n;
+        let Some(next) = start.pred_opt() else { break };
+        end = next;
+    }
+    Ok((requests, rows))
+}
+
+/// Every cached index bar for `code`, sorted, one per date.
+pub fn load_index_history(root: &Path, code: &str) -> Result<Vec<ChartBar>, DataError> {
+    let dir = root.join(code);
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in read {
+        let path = item.map_err(|e| io(&dir, e))?.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            let text = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+            out.extend(parse_index_chart(&text)?);
+        }
+    }
+    out.sort_by_key(|b| b.date);
+    out.dedup_by_key(|b| b.date);
+    Ok(out)
+}
+
 /// True once `collect_history` has stored at least one window for `code`, even an empty one.
 pub fn history_cached(root: &Path, code: &str, adjusted: &str) -> bool {
     root.join(code).join(adjusted).is_dir()
@@ -780,6 +918,102 @@ mod tests {
             .await
             .expect("retried after a busy response");
         assert_eq!(body, ok);
+    }
+
+    #[test]
+    fn index_chart_body_parses_levels() {
+        let body = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":{"bstp_nmix_prpr":"1600.18"},"output2":[
+            {"stck_bsop_date":"20100520","bstp_nmix_prpr":"1600.18","bstp_nmix_oprc":"1624.17","bstp_nmix_hgpr":"1640.47","bstp_nmix_lwpr":"1591.93","acml_vol":"358176","acml_tr_pbmn":"6560697","mod_yn":"N"},
+            {"stck_bsop_date":"20100519","bstp_nmix_prpr":"1630.50","bstp_nmix_oprc":"1640.00","bstp_nmix_hgpr":"1641.00","bstp_nmix_lwpr":"1620.00","acml_vol":"1","acml_tr_pbmn":"2","mod_yn":"N"},
+            {}]}"#;
+        let bars = parse_index_chart(body).expect("parses");
+        assert_eq!(bars.len(), 2);
+        assert!(bars[0].date < bars[1].date);
+        assert!((bars[1].close - 1600.18).abs() < 1e-9);
+        assert!((bars[0].open - 1640.0).abs() < 1e-9);
+    }
+
+    fn index_rows(n: usize) -> String {
+        let start = NaiveDate::from_ymd_opt(2010, 1, 1).expect("date");
+        let rows: Vec<String> = (0..n)
+            .map(|i| {
+                let d = start + chrono::Days::new(i as u64);
+                format!(
+                    r#"{{"stck_bsop_date":"{}","bstp_nmix_prpr":"1000.0"}}"#,
+                    d.format("%Y%m%d")
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":{{}},"output2":[{}]}}"#,
+            rows.join(",")
+        )
+    }
+
+    async fn index_server(body: String) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(TOKEN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"access_token":"t"}"#))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(INDEX_CHART_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn test_client(server: &wiremock::MockServer) -> KisClient {
+        let keys = KisKeys {
+            app_key: "k".to_owned(),
+            app_secret: "s".to_owned(),
+        };
+        KisClient::new(keys, &server.uri(), RetryPolicy::default()).expect("client")
+    }
+
+    #[tokio::test]
+    async fn index_window_at_page_cap_is_rejected_and_not_cached() {
+        let server = index_server(index_rows(INDEX_PAGE_CAP)).await;
+        let mut client = test_client(&server);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let day = NaiveDate::from_ymd_opt(2010, 3, 1).expect("date");
+        let err = collect_index_history(&mut client, dir.path(), "0001", day, day)
+            .await
+            .expect_err("a full page may be truncated");
+        assert!(matches!(
+            err,
+            DataError::InvalidField {
+                field: "output2",
+                ..
+            }
+        ));
+        assert!(!dir.path().join("0001").exists());
+    }
+
+    #[tokio::test]
+    async fn index_windows_are_cached_and_reused() {
+        let server = index_server(index_rows(3)).await;
+        let mut client = test_client(&server);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from = NaiveDate::from_ymd_opt(2010, 1, 1).expect("date");
+        let to = NaiveDate::from_ymd_opt(2010, 4, 30).expect("date");
+        let (requests, _) = collect_index_history(&mut client, dir.path(), "0001", from, to)
+            .await
+            .expect("collects");
+        assert_eq!(requests, 2, "120 days in 60-day windows");
+        let (again, _) = collect_index_history(&mut client, dir.path(), "0001", from, to)
+            .await
+            .expect("reuses");
+        assert_eq!(again, 0);
+        assert_eq!(
+            load_index_history(dir.path(), "0001").expect("loads").len(),
+            3
+        );
     }
 
     #[test]

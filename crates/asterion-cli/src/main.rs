@@ -109,6 +109,10 @@ enum Command {
     )]
     FetchHistory(FetchHistoryArgs),
     #[command(
+        about = "Fetch uncached historical KOSPI/KOSDAQ index levels from KIS daily index chart API into raw cache (resumable)"
+    )]
+    FetchIndexHistory(FetchIndexHistoryArgs),
+    #[command(
         about = "Fetch overseas daily price bars from KIS into raw cache with resumable sync and newest-page refresh"
     )]
     FetchOverseas(FetchOverseasArgs),
@@ -190,6 +194,21 @@ struct FetchHistoryArgs {
     adjusted: String,
 
     #[arg(long, default_value = kis::HISTORY_ROOT, help = "Directory for raw KIS daily chart responses")]
+    root: PathBuf,
+
+    #[arg(long, help = "Stop after sending this many API requests")]
+    max_requests: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct FetchIndexHistoryArgs {
+    #[arg(long, value_parser = parse_date, default_value = "2010-01-01", help = "Earliest date to fetch, inclusive")]
+    from: NaiveDate,
+
+    #[arg(long, value_parser = parse_date, default_value = "2020-06-30", help = "Latest date to fetch, inclusive; default overlaps 2020+ data.go.kr index series for cross-checking")]
+    to: NaiveDate,
+
+    #[arg(long, default_value = kis::INDEX_HISTORY_ROOT, help = "Directory for raw KIS daily index chart responses")]
     root: PathBuf,
 
     #[arg(long, help = "Stop after sending this many API requests")]
@@ -291,6 +310,19 @@ struct ResearchCvArgs {
         help = "Allow running with an incomplete KIS history cache (smoke tests only)"
     )]
     allow_partial_history: bool,
+
+    #[arg(
+        long,
+        help = "Prepend cached KIS KOSPI/KOSDAQ levels from fetch-index-history before data.go.kr; fails on overlap mismatch"
+    )]
+    with_index_history: bool,
+
+    #[arg(
+        long,
+        default_value = kis::INDEX_HISTORY_ROOT,
+        help = "Directory of KIS daily index chart responses from fetch-index-history (only read with --with-index-history)"
+    )]
+    index_history_root: PathBuf,
 
     #[arg(
         long,
@@ -756,6 +788,11 @@ async fn main() -> ExitCode {
         Command::FetchHistory(args) => {
             let mut progress = ProgressTracker::start(&dir, "fetch-history");
             let result = fetch_history(args, &mut progress).await;
+            finish(progress, result)
+        }
+        Command::FetchIndexHistory(args) => {
+            let mut progress = ProgressTracker::start(&dir, "fetch-index-history");
+            let result = fetch_index_history(args, &mut progress).await;
             finish(progress, result)
         }
         Command::RankScore(args) => rank_score(args),
@@ -1548,6 +1585,82 @@ fn rank_fit(args: RankLedgerArgs, progress: &mut ProgressTracker) -> CliResult<E
     Ok(ExitCode::SUCCESS)
 }
 
+// KIS sector codes for the two broad boards, in the order (KOSPI, KOSDAQ).
+const KIS_INDEX_CODES: [&str; 2] = ["0001", "1001"];
+
+async fn fetch_index_history(
+    args: FetchIndexHistoryArgs,
+    progress: &mut ProgressTracker,
+) -> CliResult<ExitCode> {
+    let policy = RetryPolicy {
+        min_interval: kis::MIN_INTERVAL,
+        ..RetryPolicy::default()
+    };
+    let mut client = KisClient::new(KisKeys::from_env()?, kis::BASE_URL, policy)?;
+    let (mut failures, mut rows, mut requests) = (0u32, 0usize, 0usize);
+    progress.stage("fetching", KIS_INDEX_CODES.len() as u64);
+    for (i, code) in KIS_INDEX_CODES.iter().enumerate() {
+        if args
+            .max_requests
+            .is_some_and(|m| client.requests_sent() >= m)
+        {
+            break;
+        }
+        progress.current(code);
+        match kis::collect_index_history(&mut client, &args.root, code, args.from, args.to).await {
+            Ok((r, n)) => {
+                requests += r;
+                rows += n;
+                println!("{code} requests={r} rows={n}");
+            }
+            Err(
+                e @ (DataError::HttpStatus { status: 401 | 403 } | DataError::MissingServiceKey(_)),
+            ) => {
+                return Err(e.into());
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("{code} error={e}");
+            }
+        }
+        progress.advance(i as u64 + 1);
+    }
+    println!("fetch_index_history_done requests={requests} rows={rows} failures={failures}");
+    Ok(if failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+// Prepends cached KIS index levels to the data.go.kr KOSPI/KOSDAQ series of `context`.
+fn splice_index_history(
+    context: &mut asterion_model::context::MarketContext,
+    root: &Path,
+) -> CliResult<()> {
+    use asterion_model::context::DailySeries;
+    let [kospi_code, kosdaq_code] = KIS_INDEX_CODES;
+    for (name, code, series) in [
+        ("kospi", kospi_code, &mut context.kospi),
+        ("kosdaq", kosdaq_code, &mut context.kosdaq),
+    ] {
+        let bars = kis::load_index_history(root, code)?;
+        let earlier = DailySeries::from_points(bars.iter().map(|b| (b.date, b.close)));
+        let out = series
+            .prepend_checked(&earlier)
+            .map_err(|e| format!("{name} ({code}): {e}"))?;
+        println!(
+            "index_history {name} prefix={} first={} overlap={} max_rel_diff={:.2e} max_gap_days={}",
+            out.prefix,
+            out.first.map_or_else(|| "-".to_owned(), |d| d.to_string()),
+            out.overlap,
+            out.max_rel_diff,
+            out.max_gap_days
+        );
+    }
+    Ok(())
+}
+
 async fn fetch_history(
     args: FetchHistoryArgs,
     progress: &mut ProgressTracker,
@@ -1712,7 +1825,11 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
     use asterion_model::research::{Fold, Panel, run_cv};
     let cache = RawCache::new(&args.universe.cache_dir);
     let symbols = resolve_symbols(&args.universe, &cache)?;
-    let context = args.context.load()?;
+    let mut context = args.context.load()?;
+    if args.with_index_history {
+        splice_index_history(&mut context, &args.index_history_root)?;
+    }
+    let context = context;
     // Same adjustment flag as the fetch-history default.
     let history = args
         .with_history

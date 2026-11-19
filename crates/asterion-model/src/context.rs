@@ -95,6 +95,112 @@ impl DailySeries {
     }
 }
 
+// Overlapping sessions needed before an earlier source may be prepended.
+const MIN_INDEX_OVERLAP: usize = 20;
+// Both sources publish the official index level, so they must agree to rounding.
+const INDEX_LEVEL_TOLERANCE: f64 = 1e-4;
+// Longest calendar gap allowed inside the prepended part (long holidays reach ~11 days).
+const MAX_INDEX_GAP_DAYS: i64 = 14;
+
+/// Outcome of prepending an earlier source to one index series.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndexSplice {
+    pub prefix: usize,
+    pub overlap: usize,
+    pub max_rel_diff: f64,
+    pub max_gap_days: i64,
+    pub first: Option<NaiveDate>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexSpliceError {
+    ShortOverlap(usize),
+    LevelMismatch {
+        date: NaiveDate,
+        current: f64,
+        earlier: f64,
+    },
+    Gap {
+        after: NaiveDate,
+        days: i64,
+    },
+}
+
+impl std::fmt::Display for IndexSpliceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IndexSpliceError::ShortOverlap(n) => write!(f, "index overlap too short: {n} sessions"),
+            IndexSpliceError::LevelMismatch {
+                date,
+                current,
+                earlier,
+            } => write!(f, "index levels disagree on {date}: {current} vs {earlier}"),
+            IndexSpliceError::Gap { after, days } => {
+                write!(f, "index history has a {days}-day gap after {after}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for IndexSpliceError {}
+
+impl DailySeries {
+    // Prepends the points of `earlier` dated before this series starts. Both must report
+    // the same level on every shared date; existing points are never changed.
+    pub fn prepend_checked(
+        &mut self,
+        earlier: &DailySeries,
+    ) -> Result<IndexSplice, IndexSpliceError> {
+        let Some(&start) = self.dates.first() else {
+            return Err(IndexSpliceError::ShortOverlap(0));
+        };
+        let (mut overlap, mut max_rel_diff) = (0usize, 0.0f64);
+        for (date, &earlier_value) in earlier.dates.iter().zip(&earlier.values) {
+            let Ok(i) = self.dates.binary_search(date) else {
+                continue;
+            };
+            let current = self.values[i];
+            let diff = (earlier_value / current - 1.0).abs();
+            if diff > INDEX_LEVEL_TOLERANCE {
+                return Err(IndexSpliceError::LevelMismatch {
+                    date: *date,
+                    current,
+                    earlier: earlier_value,
+                });
+            }
+            overlap += 1;
+            max_rel_diff = max_rel_diff.max(diff);
+        }
+        if overlap < MIN_INDEX_OVERLAP {
+            return Err(IndexSpliceError::ShortOverlap(overlap));
+        }
+        let prefix = earlier.dates.partition_point(|d| *d < start);
+        let mut max_gap_days = 0;
+        for pair in earlier.dates[..prefix].windows(2) {
+            let days = (pair[1] - pair[0]).num_days();
+            if days > MAX_INDEX_GAP_DAYS {
+                return Err(IndexSpliceError::Gap {
+                    after: pair[0],
+                    days,
+                });
+            }
+            max_gap_days = max_gap_days.max(days);
+        }
+        let first = earlier.dates[..prefix].first().copied();
+        self.dates
+            .splice(0..0, earlier.dates[..prefix].iter().copied());
+        self.values
+            .splice(0..0, earlier.values[..prefix].iter().copied());
+        Ok(IndexSplice {
+            prefix,
+            overlap,
+            max_rel_diff,
+            max_gap_days,
+            first,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MarketContext {
     pub kospi: DailySeries,
@@ -217,6 +323,56 @@ mod tests {
         assert_eq!(series.index_at(d(2), true, 5), None);
         assert_eq!(series.index_at(d(20), false, 5), None, "stale");
         assert_eq!(series.value(0), 10.0);
+    }
+
+    fn days_from(start: NaiveDate, n: u64, level: impl Fn(u64) -> f64) -> DailySeries {
+        DailySeries::from_points((0..n).map(|i| (start + chrono::Days::new(i), level(i))))
+    }
+
+    #[test]
+    fn prepend_adds_only_earlier_dates_after_overlap_check() {
+        let jan = NaiveDate::from_ymd_opt(2020, 1, 1).expect("date");
+        let dec = NaiveDate::from_ymd_opt(2019, 12, 1).expect("date");
+        let mut current = days_from(jan, 40, |i| 2000.0 + i as f64);
+        let before = current.clone();
+        // Earlier source spans 2019-12-01..2020-01-30 and matches on the 30 shared days.
+        let earlier = days_from(dec, 61, |i| 2000.0 + i as f64 - 31.0);
+        let out = current.prepend_checked(&earlier).expect("splices");
+        assert_eq!(out.prefix, 31);
+        assert_eq!(out.overlap, 30);
+        assert_eq!(out.first, Some(dec));
+        assert_eq!(current.len(), before.len() + 31);
+        assert_eq!(current.dates[31..], before.dates[..]);
+        assert_eq!(current.values[31..], before.values[..]);
+    }
+
+    #[test]
+    fn prepend_rejects_mismatch_short_overlap_and_gaps() {
+        let jan = NaiveDate::from_ymd_opt(2020, 1, 1).expect("date");
+        let dec = NaiveDate::from_ymd_opt(2019, 12, 1).expect("date");
+        let current = days_from(jan, 40, |_| 2000.0);
+        let scaled = days_from(dec, 61, |_| 2001.0);
+        assert!(matches!(
+            current.clone().prepend_checked(&scaled),
+            Err(IndexSpliceError::LevelMismatch { .. })
+        ));
+        let short = days_from(dec, 40, |_| 2000.0);
+        assert!(matches!(
+            current.clone().prepend_checked(&short),
+            Err(IndexSpliceError::ShortOverlap(9))
+        ));
+        let mut points: Vec<(NaiveDate, f64)> = (0..61)
+            .map(|i| (dec + chrono::Days::new(i), 2000.0))
+            .collect();
+        points.retain(|(d, _)| {
+            *d < NaiveDate::from_ymd_opt(2019, 12, 5).expect("date")
+                || *d > NaiveDate::from_ymd_opt(2019, 12, 25).expect("date")
+        });
+        let gapped = DailySeries::from_points(points);
+        assert!(matches!(
+            current.clone().prepend_checked(&gapped),
+            Err(IndexSpliceError::Gap { days: 22, .. })
+        ));
     }
 
     #[test]
