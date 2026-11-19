@@ -275,6 +275,41 @@ pub fn infer_kind(bars: &[Bar]) -> DelistingKind {
     }
 }
 
+// Share-count changes smaller than this are rounding, not a corporate action.
+const SHARE_CHANGE_TOLERANCE: f64 = 0.01;
+
+/// Bars with every session from the final halt on rescaled onto the pre-halt share
+/// count (implied by unadjusted market cap over close). A capital reduction during the
+/// halt is not in the exchange base price, so liquidation prices would otherwise jump.
+pub fn share_basis_after_halt(bars: &[Bar], extras: &[BarExtra]) -> Vec<Bar> {
+    let mut out = bars.to_vec();
+    let Some(h) = final_halt_start(bars).filter(|&h| h > 0) else {
+        return out;
+    };
+    let shares = |k: usize| -> Option<f64> {
+        let e = extras.get(k)?;
+        (e.market_cap > 0.0 && bars[k].close > 0.0).then(|| e.market_cap / bars[k].close)
+    };
+    let Some(base) = shares(h - 1) else {
+        return out;
+    };
+    for (k, b) in out.iter_mut().enumerate().skip(h) {
+        let Some(now) = shares(k) else {
+            continue;
+        };
+        let f = now / base;
+        if (f - 1.0).abs() > SHARE_CHANGE_TOLERANCE {
+            b.open *= f;
+            b.high *= f;
+            b.low *= f;
+            b.close *= f;
+            b.adj_close = Some(b.close);
+            b.volume = (b.volume as f64 / f).round() as u64;
+        }
+    }
+    out
+}
+
 /// Rows dated on or after `from` of a universe name whose bars stop before the data end,
 /// labelled like delisted training rows (exits through the final halt and liquidation
 /// window instead of stale halted closes; rows from the halt on are not sampled).
@@ -287,6 +322,8 @@ pub fn stopped_name_samples(
     ctx: &MarketContext,
     from: NaiveDate,
 ) -> (Vec<Sample>, DelistingKind) {
+    let rebased = share_basis_after_halt(bars, extras);
+    let bars = rebased.as_slice();
     let kind = infer_kind(bars);
     let Some(last) = bars.last() else {
         return (Vec::new(), kind);
@@ -400,6 +437,47 @@ mod tests {
         // Scheduled end inside the halt, exit at the first liquidation close.
         assert_eq!(last.target_end, day(119));
         assert!((last.forward_returns[HORIZONS.len() - 1] - (40.0 / 199.0 - 1.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_capital_reduction_during_the_halt_is_rescaled_by_share_count() {
+        let day = |i: usize| {
+            NaiveDate::from_ymd_opt(2024, 1, 1)
+                .and_then(|d| d.checked_add_days(chrono::Days::new(i as u64)))
+                .expect("date")
+        };
+        // 1000 shares at 2,000 then a 100:1 reduction: liquidation trades at 50,000.
+        let spec: Vec<(f64, u64, f64)> = (0..10)
+            .map(|_| (2000.0, 10, 1000.0))
+            .chain((0..5).map(|_| (2000.0, 0, 1000.0)))
+            .chain([(50_000.0, 10, 10.0), (40_000.0, 10, 10.0)])
+            .collect();
+        let bars: Vec<Bar> = spec
+            .iter()
+            .enumerate()
+            .map(|(i, &(c, v, _))| Bar {
+                date: day(i),
+                open: c,
+                high: c,
+                low: c,
+                close: c,
+                adj_close: Some(c),
+                volume: v,
+            })
+            .collect();
+        let extras: Vec<BarExtra> = spec
+            .iter()
+            .map(|&(c, _, s)| BarExtra {
+                market_cap: c * s,
+                trading_value: 0.0,
+            })
+            .collect();
+        let rebased = share_basis_after_halt(&bars, &extras);
+        assert!((rebased[15].close - 500.0).abs() < 1e-9);
+        assert!((rebased[16].close - 400.0).abs() < 1e-9);
+        assert_eq!(rebased[9].close, 2000.0);
+        assert_eq!(infer_kind(&rebased), DelistingKind::Distress);
+        assert_eq!(infer_kind(&bars), DelistingKind::LastPrice);
     }
 
     #[test]

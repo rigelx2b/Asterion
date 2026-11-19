@@ -2304,6 +2304,7 @@ fn relabel_stopped_names(
     let mut stopped = BTreeSet::new();
     let mut added = Vec::new();
     let (mut distress, mut liquid, mut liquid_half, mut liquid_wipe) = (0, 0, 0, 0);
+    let mut liquid_max = f64::NEG_INFINITY;
     for symbol in symbols {
         let quotes = cache.load_quotes(symbol)?;
         let Some(latest) = quotes.last() else {
@@ -2330,6 +2331,7 @@ fn relabel_stopped_names(
             let r = s.forward_returns[HORIZON_20];
             liquid_half += usize::from(r <= -0.5);
             liquid_wipe += usize::from(r <= -0.999);
+            liquid_max = liquid_max.max(r);
         }
         stopped.insert(symbol.code().to_owned());
         added.extend(rows);
@@ -2338,7 +2340,7 @@ fn relabel_stopped_names(
     samples.retain(|s| !(s.date >= from && stopped.contains(&s.symbol)));
     let removed = before - samples.len();
     println!(
-        "audit_test_delisted data_end={data_end} stopped={} distress={distress} removed={removed} added={} added_liquid={liquid} liquid_h20_half_losses={liquid_half} liquid_h20_wipeouts={liquid_wipe}",
+        "audit_test_delisted data_end={data_end} stopped={} distress={distress} removed={removed} added={} added_liquid={liquid} liquid_h20_half_losses={liquid_half} liquid_h20_wipeouts={liquid_wipe} liquid_h20_max={liquid_max:.3}",
         stopped.len(),
         added.len()
     );
