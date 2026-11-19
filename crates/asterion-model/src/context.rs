@@ -129,14 +129,23 @@ pub enum IndexSpliceError {
 impl std::fmt::Display for IndexSpliceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IndexSpliceError::ShortOverlap(n) => write!(f, "index overlap too short: {n} sessions"),
+            IndexSpliceError::ShortOverlap(n) => write!(
+                f,
+                "too few overlapping sessions ({n}) to verify index sources"
+            ),
             IndexSpliceError::LevelMismatch {
                 date,
                 current,
                 earlier,
-            } => write!(f, "index levels disagree on {date}: {current} vs {earlier}"),
+            } => write!(
+                f,
+                "index mismatch on {date}: data.go.kr {current}, kis {earlier}"
+            ),
             IndexSpliceError::Gap { after, days } => {
-                write!(f, "index history has a {days}-day gap after {after}")
+                write!(
+                    f,
+                    "kis index history gap of {days} calendar days after {after}"
+                )
             }
         }
     }

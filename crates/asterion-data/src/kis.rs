@@ -624,7 +624,9 @@ pub async fn collect_index_history(
             if n >= INDEX_PAGE_CAP {
                 return Err(DataError::InvalidField {
                     field: "output2",
-                    value: format!("{code} {start}..{end} returned {n} rows (page cap)"),
+                    value: format!(
+                        "index {code} {start}..{end}: {n} rows hit cap, may truncate, uncached"
+                    ),
                 });
             }
             let dir = path.parent().expect("index path has a parent");
