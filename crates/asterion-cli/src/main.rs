@@ -420,6 +420,21 @@ struct ResearchCvArgs {
 
     #[arg(
         long,
+        value_enum,
+        value_delimiter = ',',
+        help = "Run 20-session leakage audits (base, placebo, lag) instead of CV; writes per-row test-score CSVs next to --out (not for model selection)"
+    )]
+    audit: Vec<AuditArg>,
+
+    #[arg(
+        long,
+        requires = "audit",
+        help = "Relabel 2022+ rows for delisted names using tail-inferred halt/liquidation exits instead of stale halted closes (applies only with --audit)"
+    )]
+    audit_test_delisted: bool,
+
+    #[arg(
+        long,
         default_value = "data/ledger/cv_2026-11-13/report.json",
         help = "Output path for the JSON cross-validation report"
     )]
@@ -862,6 +877,13 @@ struct TrainArgs {
 
     #[arg(long, value_parser = parse_date, help = "First date of the held-out test period (default: 2025-01-01)")]
     test_start: Option<NaiveDate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+enum AuditArg {
+    Base,
+    Placebo,
+    Lag,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -2254,6 +2276,165 @@ fn load_delisted(
     Ok(samples)
 }
 
+// First test-fold date; audit relabelling touches rows from here on only.
+const AUDIT_TEST_FROM: (i32, u32, u32) = (2022, 1, 1);
+// A name whose last bar is this many days before the data end has stopped trading.
+const STOPPED_SLACK_DAYS: u64 = 30;
+
+// Audit: replaces the test-era rows of universe names that stopped trading with rows
+// labelled through their final halt and liquidation window.
+fn relabel_stopped_names(
+    samples: &mut Vec<asterion_model::features::Sample>,
+    cache: &RawCache,
+    symbols: &[Symbol],
+    context: &asterion_model::MarketContext,
+) -> CliResult<()> {
+    use asterion_data::krx_delisted::DelistingKind;
+    use asterion_model::features::bars_and_extras;
+    let (y, m, d) = AUDIT_TEST_FROM;
+    let from = NaiveDate::from_ymd_opt(y, m, d).ok_or("invalid audit date")?;
+    let data_end = samples
+        .iter()
+        .map(|s| s.target_end)
+        .max()
+        .ok_or("no samples")?;
+    let cutoff = data_end
+        .checked_sub_days(chrono::Days::new(STOPPED_SLACK_DAYS))
+        .ok_or("invalid cutoff")?;
+    let mut stopped = BTreeSet::new();
+    let mut added = Vec::new();
+    let (mut distress, mut liquid, mut liquid_half, mut liquid_wipe) = (0, 0, 0, 0);
+    for symbol in symbols {
+        let quotes = cache.load_quotes(symbol)?;
+        let Some(latest) = quotes.last() else {
+            continue;
+        };
+        if latest.date >= cutoff || latest.date < from {
+            continue;
+        }
+        let (bars, extras) = bars_and_extras(&quotes);
+        let (rows, kind) = asterion_model::audit::stopped_name_samples(
+            symbol.code(),
+            &bars,
+            &extras,
+            &latest.market_category,
+            context,
+            from,
+        );
+        distress += usize::from(kind == DelistingKind::Distress);
+        for s in rows
+            .iter()
+            .filter(|s| asterion_model::confidence::liquid(s))
+        {
+            liquid += 1;
+            let r = s.forward_returns[HORIZON_20];
+            liquid_half += usize::from(r <= -0.5);
+            liquid_wipe += usize::from(r <= -0.999);
+        }
+        stopped.insert(symbol.code().to_owned());
+        added.extend(rows);
+    }
+    let before = samples.len();
+    samples.retain(|s| !(s.date >= from && stopped.contains(&s.symbol)));
+    let removed = before - samples.len();
+    println!(
+        "audit_test_delisted data_end={data_end} stopped={} distress={distress} removed={removed} added={} added_liquid={liquid} liquid_h20_half_losses={liquid_half} liquid_h20_wipeouts={liquid_wipe}",
+        stopped.len(),
+        added.len()
+    );
+    samples.extend(added);
+    Ok(())
+}
+
+// Index of the 20-session horizon in HORIZONS.
+const HORIZON_20: usize = 4;
+
+fn run_audits(
+    args: &ResearchCvArgs,
+    mut panel: asterion_model::research::Panel,
+    folds: &[asterion_model::research::Fold],
+) -> CliResult<ExitCode> {
+    use asterion_model::audit::{
+        AUDIT_CANDIDATES, AuditMode, lag_features, previous_session, run_audit,
+    };
+    use std::io::Write;
+    let dir = args.out.parent().unwrap_or(Path::new(".")).to_path_buf();
+    fs::create_dir_all(&dir)?;
+    let prev = previous_session(&panel);
+    let has_prev: Vec<bool> = prev.iter().map(Option::is_some).collect();
+    let mut modes = args.audit.clone();
+    modes.sort();
+    modes.dedup();
+    let mut reports = Vec::new();
+    for m in modes {
+        let (mode, keep, seed) = match m {
+            AuditArg::Base => (AuditMode::Base, None, None),
+            AuditArg::Placebo => (AuditMode::Placebo, None, Some(20_261_119)),
+            AuditArg::Lag => {
+                // Last: overwrites the panel's features in place.
+                lag_features(&mut panel, &prev);
+                (AuditMode::Lag, Some(has_prev.as_slice()), None)
+            }
+        };
+        let (report, rows) = run_audit(
+            &mut panel,
+            folds,
+            args.embargo_days,
+            mode,
+            keep,
+            seed,
+            &|line| println!("{line}"),
+        );
+        for s in &report.summaries {
+            println!(
+                "audit={} window={} candidate={} ic={:+.4} ic_t={:+.2} excess_ann={:+.4} excess_t={:+.2} inc_ann={:+.4} inc_t={:+.2} turnover={:.3}",
+                mode.id(),
+                s.window,
+                s.candidate,
+                s.ic_mean,
+                s.ic_t,
+                s.excess_annual,
+                s.excess_t,
+                s.increment_annual,
+                s.increment_t,
+                s.mean_turnover
+            );
+        }
+        let path = dir.join(format!("audit-{}.csv", mode.id()));
+        let mut w = std::io::BufWriter::new(fs::File::create(&path)?);
+        let names: Vec<&str> = AUDIT_CANDIDATES.iter().map(|c| c.id()).collect();
+        writeln!(
+            w,
+            "fold,date,symbol,ret1,ret20,y20,has_prev,{}",
+            names.join(",")
+        )?;
+        for r in &rows {
+            let row = &panel.rows[r.row];
+            write!(
+                w,
+                "{},{},{},{},{},{},{}",
+                r.fold,
+                row.date,
+                row.symbol,
+                row.ret[0],
+                row.ret[HORIZON_20],
+                row.y[asterion_model::research::PRIMARY],
+                u8::from(has_prev[r.row])
+            )?;
+            for s in r.scores {
+                write!(w, ",{s}")?;
+            }
+            writeln!(w)?;
+        }
+        w.flush()?;
+        println!("audit_rows_out={}", path.display());
+        reports.push(report);
+    }
+    fs::write(&args.out, serde_json::to_vec_pretty(&reports)?)?;
+    println!("report_out={}", args.out.display());
+    Ok(ExitCode::SUCCESS)
+}
+
 fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResult<ExitCode> {
     use asterion_model::research::{Fold, Panel, run_cv};
     let cache = RawCache::new(&args.universe.cache_dir);
@@ -2306,6 +2487,9 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
     if args.with_delisted {
         samples.extend(load_delisted(&args, &symbols, &context)?);
     }
+    if args.audit_test_delisted {
+        relabel_stopped_names(&mut samples, &cache, &symbols, &context)?;
+    }
     let topics =
         |code: &str, date: NaiveDate| context.disclosures.topic_features(code, date).to_vec();
     let panel = Panel::build_with(
@@ -2334,6 +2518,9 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
             test_to: date(2025)?,
         },
     ];
+    if !args.audit.is_empty() {
+        return run_audits(&args, panel, &folds);
+    }
     let burnt = if args.report_burnt {
         Some(Fold {
             test_from: date(2025)?,

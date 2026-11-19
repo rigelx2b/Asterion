@@ -3,6 +3,7 @@
 //! Forecasts the price at several horizons, scores forecasts by tiered price accuracy
 //! against a no-change baseline, and explains each forecast through feature attributions.
 
+pub mod audit;
 pub mod baseline;
 pub mod calibrate;
 pub mod confidence;

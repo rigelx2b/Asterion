@@ -703,6 +703,39 @@ mod tests {
     }
 
     #[test]
+    fn features_do_not_depend_on_the_price_basis() {
+        // Back-adjustment rescales all earlier bars by one factor; no feature may see it.
+        let closes: Vec<f64> = (0..120)
+            .map(|i| 100.0 + 10.0 * (i as f64 * 0.7).sin() + i as f64)
+            .collect();
+        let base = bars(&closes);
+        let scaled: Vec<Bar> = base
+            .iter()
+            .map(|b| Bar {
+                open: b.open * 0.2,
+                high: b.high * 0.2,
+                low: b.low * 0.2,
+                close: b.close * 0.2,
+                adj_close: b.adj_close.map(|c| c * 0.2),
+                volume: b.volume * 5,
+                ..*b
+            })
+            .collect();
+        let ctx = MarketContext::default();
+        let a = extract_symbol_samples("005930", &base, &[], "KOSPI", &ctx);
+        let b = extract_symbol_samples("005930", &scaled, &[], "KOSPI", &ctx);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            for (u, v) in x.features.iter().zip(&y.features) {
+                assert!((u - v).abs() < 1e-9);
+            }
+            for (u, v) in x.forward_returns.iter().zip(&y.forward_returns) {
+                assert!((u - v).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
     fn unexplained_jump_drops_only_the_samples_whose_targets_span_it() {
         let mut closes: Vec<f64> = vec![100.0; 120];
         for close in closes.iter_mut().skip(90) {
