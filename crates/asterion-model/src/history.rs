@@ -4,7 +4,8 @@
 //! from that overlap and the KIS bars are rescaled onto the data.go.kr basis; symbols
 //! whose basis is not stable across the overlap keep their data.go.kr bars only.
 //!
-//! Index levels start in 2020, so before then `mkt_*` are 0 and `rel_ret_*` equal `log_ret_*`.
+//! Index levels start in 2020 unless `--with-index-history` prepends KIS levels; without it
+//! `mkt_*` are 0 before 2020 and `rel_ret_*` equal `log_ret_*`.
 
 use asterion_core::Bar;
 use asterion_data::kis::ChartBar;
