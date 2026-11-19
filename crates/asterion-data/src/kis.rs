@@ -522,7 +522,9 @@ pub fn chart_path(
 }
 
 /// Walks back from `to` in fixed windows, storing each body once, until `from` or the
-/// first empty window (before listing). Returns (new requests, total rows seen).
+/// first empty window (before listing). With `skip_leading_empty`, empty windows before
+/// the first bar is found (after a delisting) do not stop the walk.
+/// Returns (new requests, total rows seen).
 pub async fn collect_history(
     client: &mut KisClient,
     root: &Path,
@@ -530,6 +532,7 @@ pub async fn collect_history(
     from: NaiveDate,
     to: NaiveDate,
     adjusted: &str,
+    skip_leading_empty: bool,
 ) -> Result<(usize, usize), DataError> {
     let (mut requests, mut rows) = (0, 0);
     let mut end = to;
@@ -552,7 +555,7 @@ pub async fn collect_history(
         };
         let n = parse_chart(&body)?.len();
         rows += n;
-        if n == 0 {
+        if n == 0 && !(skip_leading_empty && rows == 0) {
             break;
         }
         let Some(next) = start.pred_opt() else { break };
@@ -1015,6 +1018,54 @@ mod tests {
         assert_eq!(
             load_index_history(dir.path(), "0001").expect("loads").len(),
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn leading_empty_windows_are_skipped_only_when_asked() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(TOKEN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"access_token":"t"}"#))
+            .mount(&server)
+            .await;
+        // Only the window ending 2019-08-13 (second from the end) holds a bar.
+        let bar = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":{},"output2":[{"stck_bsop_date":"20190801","stck_clpr":"100","stck_oprc":"100","stck_hgpr":"100","stck_lwpr":"100","acml_vol":"1","acml_tr_pbmn":"100"}]}"#;
+        Mock::given(method("GET"))
+            .and(path(CHART_PATH))
+            .and(query_param("FID_INPUT_DATE_2", "20190813"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bar))
+            .mount(&server)
+            .await;
+        let empty = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":{},"output2":[]}"#;
+        Mock::given(method("GET"))
+            .and(path(CHART_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(empty))
+            .mount(&server)
+            .await;
+        let from = NaiveDate::from_ymd_opt(2019, 1, 1).expect("date");
+        let to = NaiveDate::from_ymd_opt(2019, 12, 31).expect("date");
+
+        let mut client = test_client(&server);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (requests, rows) =
+            collect_history(&mut client, dir.path(), "000001", from, to, "0", false)
+                .await
+                .expect("collects");
+        assert_eq!((requests, rows), (1, 0), "stops at the first empty window");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (requests, rows) =
+            collect_history(&mut client, dir.path(), "000001", from, to, "0", true)
+                .await
+                .expect("collects");
+        assert_eq!(
+            (requests, rows),
+            (3, 1),
+            "skips the leading empty window, stops after data"
         );
     }
 

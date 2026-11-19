@@ -198,6 +198,12 @@ struct FetchHistoryArgs {
 
     #[arg(long, help = "Stop after sending this many API requests")]
     max_requests: Option<u32>,
+
+    #[arg(
+        long,
+        help = "Walk back past empty windows until a bar is found (for delisted stocks; normally stops at first empty)"
+    )]
+    skip_leading_empty: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1690,6 +1696,7 @@ async fn fetch_history(
             args.from,
             args.to,
             &args.adjusted,
+            args.skip_leading_empty,
         )
         .await
         {
