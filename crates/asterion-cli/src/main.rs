@@ -2205,14 +2205,20 @@ fn load_delisted(
         args.history_from,
     )?;
     println!(
-        "delisted names={} distress={} no_shares={} samples={} terminal_exits={} halt_sessions_skipped={} missing_history={}",
+        "delisted names={} distress={} no_shares={} samples={} terminal_exits={} halt_sessions_skipped={} missing_history={} distress_tails[liquidation,trailing_halt,no_halt]={},{},{} liquid={} liquid_wipeouts={} liquid_half_losses={}",
         c.names,
         c.distress,
         c.no_shares,
         c.samples,
         c.terminal_exits,
         c.halt_sessions_skipped,
-        missing.len()
+        missing.len(),
+        c.distress_liquidation,
+        c.distress_trailing_halt,
+        c.distress_no_halt,
+        c.liquid,
+        c.liquid_wipeouts,
+        c.liquid_half_losses
     );
     let names = asterion_model::history::COVERAGE_FEATURES.join(",");
     for (year, n, shares) in asterion_model::history::coverage_by_year(&samples) {

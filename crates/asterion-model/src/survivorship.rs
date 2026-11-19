@@ -7,8 +7,9 @@
 //! the terminal value when nothing trades after it. Samples are dated before the final
 //! halt only: from the halt on, the delisting is public and no feature represents it.
 //!
-//! Market cap uses OpenDART share counts (see [`asterion_data::dart_shares::shares_on`]),
-//! which may be later information for early rows; these samples are for training only.
+//! KIS closes under flag `0` are split-adjusted, so market cap is the close times the
+//! OpenDART share count known at the delisting date, as for spliced history: later
+//! information for earlier rows, so these samples are for training only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -20,6 +21,7 @@ use asterion_data::kis::{ChartBar, history_cached, load_history};
 use asterion_data::krx_delisted::{DelistedListing, DelistingKind, classify, is_board_transfer};
 use chrono::NaiveDate;
 
+use crate::confidence::liquid;
 use crate::context::MarketContext;
 use crate::features::{BarExtra, Sample, WARMUP, features_at};
 use crate::metrics::HORIZONS;
@@ -40,11 +42,20 @@ pub struct DelistedCounts {
     pub terminal_exits: usize,
     // Sessions from the final halt on, never sampled.
     pub halt_sessions_skipped: usize,
+    // Distress names by tail shape: halt then liquidation trades, halt to the end, no halt.
+    pub distress_liquidation: usize,
+    pub distress_trailing_halt: usize,
+    pub distress_no_halt: usize,
+    // Liquid samples (see `confidence::liquid`), those whose longest horizon is a total
+    // loss, and those losing at least half.
+    pub liquid: usize,
+    pub liquid_wipeouts: usize,
+    pub liquid_half_losses: usize,
 }
 
-/// KIS bars as unadjusted [`Bar`]s with market cap from the share count known on each date.
+/// KIS bars as [`Bar`]s with market cap from one share count (zero when unknown).
 /// Inconsistent bars are dropped; halted sessions keep their stale close.
-pub fn chart_bars(history: &[ChartBar], shares: &[ShareCount]) -> (Vec<Bar>, Vec<BarExtra>) {
+pub fn chart_bars(history: &[ChartBar], shares: Option<u64>) -> (Vec<Bar>, Vec<BarExtra>) {
     let mut bars = Vec::with_capacity(history.len());
     let mut extras = Vec::with_capacity(history.len());
     for h in history {
@@ -60,7 +71,7 @@ pub fn chart_bars(history: &[ChartBar], shares: &[ShareCount]) -> (Vec<Bar>, Vec
         if !bar.is_ohlc_consistent() {
             continue;
         }
-        let market_cap = shares_on(shares, h.date).map_or(0.0, |s| s as f64 * h.close);
+        let market_cap = shares.map_or(0.0, |s| s as f64 * h.close);
         bars.push(bar);
         extras.push(BarExtra {
             market_cap,
@@ -109,6 +120,13 @@ pub fn extract_delisted_samples(
         return (Vec::new(), counts);
     };
     let halt = final_halt_start(bars);
+    if kind == DelistingKind::Distress {
+        match halt {
+            None => counts.distress_no_halt = 1,
+            Some(h) if h > last_traded => counts.distress_trailing_halt = 1,
+            Some(_) => counts.distress_liquidation = 1,
+        }
+    }
     let sample_end = halt.unwrap_or(last_traded + 1);
     counts.halt_sessions_skipped = bars.len() - sample_end;
     let terminal = match kind {
@@ -218,7 +236,7 @@ pub fn select_delisted(
     Ok(out)
 }
 
-/// Samples of every name in `names` from cached KIS bars (unadjusted flag `adjusted`),
+/// Samples of every name in `names` from cached KIS bars (adjustment flag `adjusted`),
 /// dated on or after `samples_from`. Returns the codes with no KIS cache separately.
 pub fn load_delisted_samples(
     names: &[DelistedName],
@@ -239,7 +257,7 @@ pub fn load_delisted_samples(
         let mut history = load_history(history_root, &name.code, adjusted)?;
         history.retain(|h| h.date <= name.date);
         let counts_for = shares.get(&name.code).map_or(&[][..], Vec::as_slice);
-        let (bars, extras) = chart_bars(&history, counts_for);
+        let (bars, extras) = chart_bars(&history, shares_on(counts_for, name.date));
         let (samples, mut c) = extract_delisted_samples(
             &name.code,
             &bars,
@@ -255,6 +273,12 @@ pub fn load_delisted_samples(
             .filter(|s| s.date >= samples_from)
             .collect();
         c.samples = samples.len();
+        for s in samples.iter().filter(|s| liquid(s)) {
+            let longest = s.forward_returns.last().copied().unwrap_or(0.0);
+            c.liquid += 1;
+            c.liquid_wipeouts += usize::from(longest <= -1.0);
+            c.liquid_half_losses += usize::from(longest <= -0.5);
+        }
         counts.add(c);
         all.extend(samples);
     }
@@ -269,6 +293,12 @@ impl DelistedCounts {
         self.samples += other.samples;
         self.terminal_exits += other.terminal_exits;
         self.halt_sessions_skipped += other.halt_sessions_skipped;
+        self.distress_liquidation += other.distress_liquidation;
+        self.distress_trailing_halt += other.distress_trailing_halt;
+        self.distress_no_halt += other.distress_no_halt;
+        self.liquid += other.liquid;
+        self.liquid_wipeouts += other.liquid_wipeouts;
+        self.liquid_half_losses += other.liquid_half_losses;
     }
 }
 
