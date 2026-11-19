@@ -115,6 +115,14 @@ enum Command {
     )]
     FetchIndexHistory(FetchIndexHistoryArgs),
     #[command(
+        about = "Probe KIS daily stock investor-trade quotes and print row counts, date range, and fields without caching"
+    )]
+    ProbeInvestorDaily(ProbeInvestorDailyArgs),
+    #[command(
+        about = "Fetch uncached per-stock daily investor flows (foreign, institution, individual) from KIS API into raw cache (resumable)"
+    )]
+    FetchInvestorHistory(FetchInvestorHistoryArgs),
+    #[command(
         about = "Download OpenDART corporation code list (corpCode.xml, all companies including delisted) to a local file"
     )]
     FetchCorpCodes(FetchCorpCodesArgs),
@@ -272,6 +280,37 @@ struct FetchIndexHistoryArgs {
 
     #[arg(long, help = "Stop after sending this many API requests")]
     max_requests: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct FetchInvestorHistoryArgs {
+    #[command(flatten)]
+    universe: UniverseArgs,
+
+    #[arg(long, value_parser = parse_date, default_value = "2019-10-01", help = "Earliest session date to collect, inclusive (default adds pre-2020 warm-up)")]
+    from: NaiveDate,
+
+    #[arg(long, value_parser = parse_date, default_value = "2024-12-31", help = "Latest request date, inclusive (default covers walk-forward test folds)")]
+    to: NaiveDate,
+
+    #[arg(long, default_value = kis::INVESTOR_DAILY_ROOT, help = "Directory for raw KIS per-stock daily investor flow responses")]
+    root: PathBuf,
+
+    #[arg(long, help = "Stop after sending this many API requests")]
+    max_requests: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct ProbeInvestorDailyArgs {
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Comma-separated 6-digit KRX short codes to probe"
+    )]
+    symbols: Vec<String>,
+
+    #[arg(long, value_delimiter = ',', value_parser = parse_date, help = "Comma-separated request end dates (YYYY-MM-DD)")]
+    dates: Vec<NaiveDate>,
 }
 
 #[derive(Debug, Args)]
@@ -963,6 +1002,12 @@ async fn main() -> ExitCode {
         Command::FetchHistory(args) => {
             let mut progress = ProgressTracker::start(&dir, "fetch-history");
             let result = fetch_history(args, &mut progress).await;
+            finish(progress, result)
+        }
+        Command::ProbeInvestorDaily(args) => probe_investor_daily(args).await,
+        Command::FetchInvestorHistory(args) => {
+            let mut progress = ProgressTracker::start(&dir, "fetch-investor-history");
+            let result = fetch_investor_history(args, &mut progress).await;
             finish(progress, result)
         }
         Command::FetchIndexHistory(args) => {
@@ -1980,6 +2025,98 @@ async fn fetch_dart_backfill(
 
 // KIS sector codes for the two broad boards, in the order (KOSPI, KOSDAQ).
 const KIS_INDEX_CODES: [&str; 2] = ["0001", "1001"];
+
+async fn fetch_investor_history(
+    args: FetchInvestorHistoryArgs,
+    progress: &mut ProgressTracker,
+) -> CliResult<ExitCode> {
+    let cache = RawCache::new(&args.universe.cache_dir);
+    let symbols = resolve_symbols(&args.universe, &cache)?;
+    let policy = RetryPolicy {
+        min_interval: kis::MIN_INTERVAL,
+        ..RetryPolicy::default()
+    };
+    let mut client = KisClient::new(KisKeys::from_env()?, kis::BASE_URL, policy)?;
+    let (mut failures, mut rows, mut requests) = (0u32, 0usize, 0usize);
+    progress.stage("fetching", symbols.len() as u64);
+    for (i, symbol) in symbols.iter().enumerate() {
+        if args
+            .max_requests
+            .is_some_and(|m| client.requests_sent() >= m)
+        {
+            break;
+        }
+        let code = symbol.code();
+        progress.current(code);
+        match kis::collect_investor_daily(&mut client, &args.root, code, args.from, args.to).await {
+            Ok((r, n)) => {
+                requests += r;
+                rows += n;
+                println!("{code} requests={r} rows={n}");
+            }
+            Err(
+                e @ (DataError::HttpStatus { status: 401 | 403 } | DataError::MissingServiceKey(_)),
+            ) => {
+                return Err(e.into());
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("{code} error={e}");
+            }
+        }
+        progress.advance(i as u64 + 1);
+    }
+    println!("fetch_investor_history_done requests={requests} rows={rows} failures={failures}");
+    Ok(if failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+// Read-only: prints the shape of investor-daily responses; nothing is cached.
+async fn probe_investor_daily(args: ProbeInvestorDailyArgs) -> CliResult<ExitCode> {
+    let policy = RetryPolicy {
+        min_interval: kis::MIN_INTERVAL,
+        ..RetryPolicy::default()
+    };
+    let mut client = KisClient::new(KisKeys::from_env()?, kis::BASE_URL, policy)?;
+    for code in &args.symbols {
+        for &date in &args.dates {
+            match client.fetch_investor_daily(code, date).await {
+                Ok(body) => {
+                    let v: serde_json::Value = serde_json::from_str(&body)?;
+                    let rows = v["output2"].as_array().cloned().unwrap_or_default();
+                    let dates: Vec<&str> = rows
+                        .iter()
+                        .filter_map(|r| r["stck_bsop_date"].as_str())
+                        .collect();
+                    let first = rows.first().and_then(|r| r.as_object());
+                    let keys: Vec<&String> = first.map(|o| o.keys().collect()).unwrap_or_default();
+                    let sample = |k: &str| first.and_then(|o| o.get(k)).cloned();
+                    println!(
+                        "probe code={code} date={date} rows={} newest={:?} oldest={:?} frgn_ntby_qty={:?} orgn_ntby_qty={:?} frgn_ntby_tr_pbmn={:?} acml_vol={:?} acml_tr_pbmn={:?} output1_keys={} keys={}",
+                        rows.len(),
+                        dates.first(),
+                        dates.last(),
+                        sample("frgn_ntby_qty"),
+                        sample("orgn_ntby_qty"),
+                        sample("frgn_ntby_tr_pbmn"),
+                        sample("acml_vol"),
+                        sample("acml_tr_pbmn"),
+                        v["output1"].as_object().map_or(0, |o| o.len()),
+                        keys.iter()
+                            .map(|k| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    );
+                }
+                Err(e) => println!("probe code={code} date={date} error={e}"),
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
 async fn fetch_index_history(
     args: FetchIndexHistoryArgs,

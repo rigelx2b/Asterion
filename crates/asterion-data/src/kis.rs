@@ -30,8 +30,12 @@ const BACKEND_BUSY_CODE: &str = "OPSQ0008";
 const BUSY_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 const CHART_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice";
 const CHART_TR_ID: &str = "FHKST03010100";
+const INVESTOR_DAILY_PATH: &str =
+    "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily";
+const INVESTOR_DAILY_TR_ID: &str = "FHPTJ04160001";
 const INDEX_CHART_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice";
 const INDEX_CHART_TR_ID: &str = "FHKUP03500100";
+pub const INVESTOR_DAILY_ROOT: &str = "data/raw/kis_investor_daily";
 pub const INDEX_HISTORY_ROOT: &str = "data/raw/kis_index";
 // The index chart returns at most this many rows per call, newest first.
 const INDEX_PAGE_CAP: usize = 50;
@@ -238,6 +242,24 @@ impl KisClient {
             ("FID_ORG_ADJ_PRC", adjusted),
         ];
         self.fetch_daily(CHART_PATH, CHART_TR_ID, &query).await
+    }
+
+    /// Raw JSON body of daily investor-type flows for one code, sessions up to `date`.
+    pub async fn fetch_investor_daily(
+        &mut self,
+        code: &str,
+        date: NaiveDate,
+    ) -> Result<String, DataError> {
+        let d = date.format("%Y%m%d").to_string();
+        let query = [
+            ("FID_COND_MRKT_DIV_CODE", "J"),
+            ("FID_INPUT_ISCD", code),
+            ("FID_INPUT_DATE_1", d.as_str()),
+            ("FID_ORG_ADJ_PRC", ""),
+            ("FID_ETC_CLS_CODE", ""),
+        ];
+        self.fetch_daily(INVESTOR_DAILY_PATH, INVESTOR_DAILY_TR_ID, &query)
+            .await
     }
 
     /// Raw JSON body of daily index levels for one KIS sector code (`0001` KOSPI,
@@ -646,6 +668,110 @@ pub async fn collect_index_history(
     Ok((requests, rows))
 }
 
+/// One session of investor-type flows from the per-stock daily endpoint.
+/// Net-buy values are in million KRW; `trading_value` is in KRW; quantities in shares.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InvestorDay {
+    pub date: NaiveDate,
+    pub foreign_net_qty: f64,
+    pub institution_net_qty: f64,
+    pub individual_net_qty: f64,
+    pub foreign_net_value: f64,
+    pub institution_net_value: f64,
+    pub individual_net_value: f64,
+    pub volume: f64,
+    pub trading_value: f64,
+}
+
+pub fn parse_investor_daily(body: &str) -> Result<Vec<InvestorDay>, DataError> {
+    let env: ChartEnvelope = serde_json::from_str(body)?;
+    let mut out = Vec::new();
+    for row in &env.output2 {
+        let raw_date = row
+            .get("stck_bsop_date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if raw_date.is_empty() {
+            continue;
+        }
+        let date =
+            NaiveDate::parse_from_str(raw_date, "%Y%m%d").map_err(|_| DataError::InvalidField {
+                field: "stck_bsop_date",
+                value: raw_date.to_owned(),
+            })?;
+        out.push(InvestorDay {
+            date,
+            foreign_net_qty: number(row, "frgn_ntby_qty")?,
+            institution_net_qty: number(row, "orgn_ntby_qty")?,
+            individual_net_qty: number(row, "prsn_ntby_qty")?,
+            foreign_net_value: number(row, "frgn_ntby_tr_pbmn")?,
+            institution_net_value: number(row, "orgn_ntby_tr_pbmn")?,
+            individual_net_value: number(row, "prsn_ntby_tr_pbmn")?,
+            volume: number(row, "acml_vol")?,
+            trading_value: number(row, "acml_tr_pbmn")?,
+        });
+    }
+    out.sort_by_key(|d| d.date);
+    out.dedup_by_key(|d| d.date);
+    Ok(out)
+}
+
+/// Walks back from `to` until `from` in pages of the 30 sessions ending at a request
+/// date, storing each body once at `<root>/<code>/<end>.json`. The next end is the day
+/// before the oldest session returned, so a resumed walk replays the cached chain.
+pub async fn collect_investor_daily(
+    client: &mut KisClient,
+    root: &Path,
+    code: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<(usize, usize), DataError> {
+    let (mut requests, mut rows) = (0, 0);
+    let mut end = to;
+    while end >= from {
+        let path = root.join(code).join(format!("{end}.json"));
+        let body = if path.exists() {
+            fs::read_to_string(&path).map_err(|e| io(&path, e))?
+        } else {
+            let body = client.fetch_investor_daily(code, end).await?;
+            requests += 1;
+            let dir = path.parent().expect("investor path has a parent");
+            fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, &body).map_err(|e| io(&tmp, e))?;
+            fs::rename(&tmp, &path).map_err(|e| io(&path, e))?;
+            body
+        };
+        let days = parse_investor_daily(&body)?;
+        rows += days.len();
+        let Some(oldest) = days.first().map(|d| d.date).filter(|d| *d <= end) else {
+            break;
+        };
+        let Some(next) = oldest.pred_opt() else { break };
+        end = next;
+    }
+    Ok((requests, rows))
+}
+
+/// Every cached investor day for `code`, sorted, one per date.
+pub fn load_investor_daily(root: &Path, code: &str) -> Result<Vec<InvestorDay>, DataError> {
+    let dir = root.join(code);
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in read {
+        let path = item.map_err(|e| io(&dir, e))?.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            let text = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+            out.extend(parse_investor_daily(&text)?);
+        }
+    }
+    out.sort_by_key(|d| d.date);
+    out.dedup_by_key(|d| d.date);
+    Ok(out)
+}
+
 /// Every cached index bar for `code`, sorted, one per date.
 pub fn load_index_history(root: &Path, code: &str) -> Result<Vec<ChartBar>, DataError> {
     let dir = root.join(code);
@@ -842,6 +968,23 @@ mod tests {
         {"stck_bsop_date":"20261111","stck_clpr":"205900","prsn_ntby_qty":"-1200","frgn_ntby_qty":"900","orgn_ntby_qty":"300","prsn_ntby_tr_pbmn":"-247","frgn_ntby_tr_pbmn":"185","orgn_ntby_tr_pbmn":"62"},
         {"stck_bsop_date":"20261110","stck_clpr":"204000","prsn_ntby_qty":"","frgn_ntby_qty":"-5","orgn_ntby_qty":"5","prsn_ntby_tr_pbmn":"0","frgn_ntby_tr_pbmn":"-1","orgn_ntby_tr_pbmn":"1"}
     ]}"#;
+
+    #[test]
+    fn parses_daily_investor_pages_oldest_first() {
+        let body = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":{},"output2":[
+            {"stck_bsop_date":"20150130","frgn_ntby_qty":"-24649","orgn_ntby_qty":"28450","prsn_ntby_qty":"-3801","frgn_ntby_tr_pbmn":"-33681","orgn_ntby_tr_pbmn":"38900","prsn_ntby_tr_pbmn":"-5219","acml_vol":"16110","acml_tr_pbmn":"440683045910"},
+            {"stck_bsop_date":"20150129","frgn_ntby_qty":"1","orgn_ntby_qty":"","prsn_ntby_qty":"-1","frgn_ntby_tr_pbmn":"2","orgn_ntby_tr_pbmn":"0","prsn_ntby_tr_pbmn":"-2","acml_vol":"10","acml_tr_pbmn":"1000"}
+        ]}"#;
+        let days = parse_investor_daily(body).expect("parses");
+        assert_eq!(days.len(), 2);
+        assert_eq!(
+            days[0].date,
+            NaiveDate::from_ymd_opt(2015, 1, 29).expect("date")
+        );
+        assert_eq!(days[0].institution_net_qty, 0.0);
+        assert_eq!(days[1].foreign_net_value, -33681.0);
+        assert_eq!(days[1].trading_value, 440_683_045_910.0);
+    }
 
     #[test]
     fn parses_rows_oldest_first_and_blank_as_zero() {
