@@ -213,7 +213,7 @@ asterion fetch-index-history
 # OpenDART 기업 고유번호 목록 수집 (상장폐지 기업 포함)
 asterion fetch-corp-codes
 
-# 시장 구분 피드에서 누락된 유니버스 종목의 기업별 공시·주요 재무 백필 수집 (이후 연구 명령에 --dart-backfill-root data/raw/opendart_backfill/universe 전달)
+# 시장 구분 피드에서 누락된 유니버스 종목의 기업별 공시·주요 재무 백필을 수집한다 (이 백필 디렉터리가 연구 명령의 --dart-backfill-root 기본값이며, --dart-backfill-root를 전달하면 기본값을 대체하고 --no-dart-backfill은 모든 백필을 비활성화한다)
 asterion fetch-dart-backfill --universe config/universe/kr-union.txt --root data/raw/opendart_backfill/universe
 
 # 2015–2019년 상장폐지 종목의 OpenDART 공시·주요 재무·발행 주식 수(2019년까지) 백필 수집
@@ -243,7 +243,7 @@ asterion monitor
 2. 저장 공간 확보 후 Arctic Shift 덤프 파일을 통한 Reddit 과거 이력 적재(최근 일자는 기존 API 유지).
 3. **완료 (2026-11-19)**: 2010–2020 KIS 과거 일봉·OpenDART 재무제표를 피처에 반영해 purged walk-forward CV 재실행 완료(전 후보 미통과, 측정 가능한 개선 없음; 5절 `--with-history` 결과 참조).
 4. Forward paper ledger 채점을 지속하며, 비용 차감 후 표본 외에서 유의미한 성능이 확인될 때만 우위(edge)를 인정.
-5. `--dart-backfill-root`를 기본 설정으로 채택할지 여부와, 백필 미적용 상태에서 학습·동결된 forward paper ledger의 `rank-fit` arm들을 재학습(refit)할지 여부를 결정한다.
+5. **완료 (2026-11-19)**: `--dart-backfill-root`의 기본값을 `data/raw/opendart_backfill/universe`로 지정하기로 결정했다(플래그를 명시하면 기본값을 대체하고, `--no-dart-backfill`로 이전 실행을 재현할 수 있다). 또한 포워드 페이퍼 원장의 동결된 rank-fit 암은 재적합하지 않기로 결정했다(영향이 IC 약 0.001 수준이며 재적합 시 원장을 다시 시작해야 한다).
 
 ---
 

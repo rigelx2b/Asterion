@@ -442,10 +442,21 @@ struct ContextArgs {
 
     #[arg(
         long,
-        help = "Repeatable fetch-dart-backfill directory adding filings and key accounts for missing codes; fails on overlap"
+        default_value = DEFAULT_DART_BACKFILL_ROOT,
+        help = "Directory from fetch-dart-backfill for missing OpenDART codes (repeatable, replaces default; fails on overlap)"
     )]
     dart_backfill_root: Vec<PathBuf>,
+
+    #[arg(
+        long,
+        conflicts_with = "dart_backfill_root",
+        help = "Disable all fetch-dart-backfill directories (including the default) to use only main OpenDART caches"
+    )]
+    no_dart_backfill: bool,
 }
+
+// Backfill of the universe names missing from the board feeds (fetch-dart-backfill --root).
+const DEFAULT_DART_BACKFILL_ROOT: &str = "data/raw/opendart_backfill/universe";
 
 // Subdirectories of a fetch-dart-backfill root.
 const BACKFILL_FILINGS_DIR: &str = "filings";
@@ -455,8 +466,12 @@ const BACKFILL_SHARES_DIR: &str = "shares";
 impl ContextArgs {
     fn load(&self) -> CliResult<asterion_model::MarketContext> {
         use asterion_model::context::DartBackfill;
-        let caches: Vec<(RawCache, RawCache)> = self
-            .dart_backfill_root
+        let roots: &[PathBuf] = if self.no_dart_backfill {
+            &[]
+        } else {
+            &self.dart_backfill_root
+        };
+        let caches: Vec<(RawCache, RawCache)> = roots
             .iter()
             .map(|root| {
                 (
@@ -2463,4 +2478,39 @@ fn predict(args: PredictArgs) -> CliResult<ExitCode> {
         None => println!("{json}"),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(args: &[&str]) -> Result<ContextArgs, clap::Error> {
+        let mut argv = vec!["asterion", "research-cv"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)?.command {
+            Command::ResearchCv(a) => Ok(a.context),
+            other => panic!("unexpected command {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dart_backfill_defaults_to_the_universe_root_and_can_be_replaced_or_disabled() {
+        let default = context(&[]).expect("parse");
+        assert_eq!(
+            default.dart_backfill_root,
+            [PathBuf::from(DEFAULT_DART_BACKFILL_ROOT)]
+        );
+        assert!(!default.no_dart_backfill);
+
+        let explicit =
+            context(&["--dart-backfill-root", "x", "--dart-backfill-root", "y"]).expect("parse");
+        assert_eq!(
+            explicit.dart_backfill_root,
+            [PathBuf::from("x"), PathBuf::from("y")]
+        );
+
+        let off = context(&["--no-dart-backfill"]).expect("parse");
+        assert!(off.no_dart_backfill);
+        assert!(context(&["--no-dart-backfill", "--dart-backfill-root", "x"]).is_err());
+    }
 }
