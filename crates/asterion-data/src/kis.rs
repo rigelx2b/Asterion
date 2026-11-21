@@ -35,6 +35,8 @@ const INVESTOR_DAILY_PATH: &str =
 const INVESTOR_DAILY_TR_ID: &str = "FHPTJ04160001";
 const SHORT_SALE_DAILY_PATH: &str = "/uapi/domestic-stock/v1/quotations/daily-short-sale";
 const SHORT_SALE_DAILY_TR_ID: &str = "FHPST04830000";
+// Read-only market-data endpoints; order and account APIs live under other prefixes.
+pub const QUOTATIONS_PREFIX: &str = "/uapi/domestic-stock/v1/quotations/";
 const INDEX_CHART_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice";
 const INDEX_CHART_TR_ID: &str = "FHKUP03500100";
 pub const INVESTOR_DAILY_ROOT: &str = "data/raw/kis_investor_daily";
@@ -315,6 +317,23 @@ impl KisClient {
         ];
         self.fetch_daily(INDEX_CHART_PATH, INDEX_CHART_TR_ID, &query)
             .await
+    }
+
+    /// Raw JSON body of any domestic-stock quotation endpoint (read-only market data).
+    /// Paths outside the quotations prefix are refused, so no order or account API can be reached.
+    pub async fn fetch_quotation(
+        &mut self,
+        path: &str,
+        tr_id: &str,
+        query: &[(&str, &str)],
+    ) -> Result<String, DataError> {
+        if !is_quotation_path(path) {
+            return Err(DataError::InvalidField {
+                field: "path",
+                value: path.to_owned(),
+            });
+        }
+        self.fetch_daily(path, tr_id, query).await
     }
 
     // Shared GET for the daily chart endpoints, retrying rate-limit and busy-backend replies.
@@ -787,6 +806,11 @@ pub async fn collect_investor_daily(
     Ok((requests, rows))
 }
 
+/// True only for paths under the read-only quotations prefix.
+pub fn is_quotation_path(path: &str) -> bool {
+    path.starts_with(QUOTATIONS_PREFIX) && !path.contains("..") && !path.contains('?')
+}
+
 /// One session of short-sale trading (not balances) from the per-stock daily endpoint.
 /// `short_value` and `trading_value` are in KRW; quantities in shares.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1117,6 +1141,22 @@ mod tests {
         assert_eq!(days[0].institution_net_qty, 0.0);
         assert_eq!(days[1].foreign_net_value, -33681.0);
         assert_eq!(days[1].trading_value, 440_683_045_910.0);
+    }
+
+    #[test]
+    fn quotation_probe_refuses_order_and_account_paths() {
+        assert!(is_quotation_path(
+            "/uapi/domestic-stock/v1/quotations/daily-loan-trans"
+        ));
+        assert!(!is_quotation_path(
+            "/uapi/domestic-stock/v1/trading/order-cash"
+        ));
+        assert!(!is_quotation_path(
+            "/uapi/domestic-stock/v1/trading/inquire-balance"
+        ));
+        assert!(!is_quotation_path(
+            "/uapi/domestic-stock/v1/quotations/../trading/order-cash"
+        ));
     }
 
     #[test]

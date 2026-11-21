@@ -123,6 +123,10 @@ enum Command {
     )]
     ProbeShortSale(ProbeShortSaleArgs),
     #[command(
+        about = "Probe a KIS domestic-stock quotation endpoint (market-data only) and print row counts, date range, and fields without caching"
+    )]
+    ProbeQuotation(ProbeQuotationArgs),
+    #[command(
         about = "Fetch uncached per-stock daily short-sale trading (volume and value, not balances) from KIS API into raw cache (resumable)"
     )]
     FetchShortSaleHistory(FetchShortSaleHistoryArgs),
@@ -318,6 +322,28 @@ struct FetchShortSaleHistoryArgs {
 
     #[arg(long, default_value = kis::SHORT_SALE_ROOT, help = "Cache directory for raw KIS per-stock daily short-sale trading responses")]
     root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ProbeQuotationArgs {
+    #[arg(
+        long,
+        help = "Quotation endpoint path (must start with /uapi/domestic-stock/v1/quotations/)"
+    )]
+    path: String,
+
+    #[arg(long, help = "KIS TR ID header for the quotation endpoint")]
+    tr_id: String,
+
+    #[arg(long = "param", value_parser = parse_key_value, help = "Query parameter as KEY=VALUE (repeatable)")]
+    params: Vec<(String, String)>,
+}
+
+fn parse_key_value(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got {s}"))?;
+    Ok((k.to_owned(), v.to_owned()))
 }
 
 #[derive(Debug, Args)]
@@ -1076,6 +1102,7 @@ async fn main() -> ExitCode {
         }
         Command::ProbeInvestorDaily(args) => probe_investor_daily(args).await,
         Command::ProbeShortSale(args) => probe_short_sale(args).await,
+        Command::ProbeQuotation(args) => probe_quotation(args).await,
         Command::FetchShortSaleHistory(args) => {
             let mut progress = ProgressTracker::start(&dir, "fetch-short-sale-history");
             let result = fetch_short_sale_history(args, &mut progress).await;
@@ -2276,6 +2303,59 @@ async fn probe_investor_daily(args: ProbeInvestorDailyArgs) -> CliResult<ExitCod
                 }
                 Err(e) => println!("probe code={code} date={date} error={e}"),
             }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// Read-only: prints the shape of one quotation response; nothing is cached.
+async fn probe_quotation(args: ProbeQuotationArgs) -> CliResult<ExitCode> {
+    let policy = RetryPolicy {
+        min_interval: kis::MIN_INTERVAL,
+        ..RetryPolicy::default()
+    };
+    let mut client = KisClient::new(KisKeys::from_env()?, kis::BASE_URL, policy)?;
+    let query: Vec<(&str, &str)> = args
+        .params
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let body = match client
+        .fetch_quotation(&args.path, &args.tr_id, &query)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            println!("probe path={} error={e}", args.path);
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    for key in ["output", "output1", "output2"] {
+        let rows: Vec<serde_json::Value> = match &v[key] {
+            serde_json::Value::Array(a) => a.clone(),
+            serde_json::Value::Object(_) => vec![v[key].clone()],
+            _ => continue,
+        };
+        let date_of = |r: &serde_json::Value| {
+            ["stck_bsop_date", "bsop_date", "deal_date", "stlm_date"]
+                .iter()
+                .find_map(|k| r[*k].as_str().map(str::to_owned))
+        };
+        let first = rows.first();
+        let keys: Vec<String> = first
+            .and_then(|r| r.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        println!(
+            "probe {key} rows={} first_date={:?} last_date={:?} keys={}",
+            rows.len(),
+            first.and_then(date_of),
+            rows.last().and_then(date_of),
+            keys.join("|")
+        );
+        if let Some(r) = first {
+            println!("probe {key} first_row={r}");
         }
     }
     Ok(ExitCode::SUCCESS)
