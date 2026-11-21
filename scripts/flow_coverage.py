@@ -35,8 +35,9 @@ def flow_sessions(root: str, code: str) -> set[str]:
     out: set[str] = set()
     for f in glob.glob(os.path.join(root, code, "*.json")):
         j = json.load(open(f, encoding="utf-8"))
-        for r in j.get("output2") or []:
-            d = r.get("stck_bsop_date")
+        # Investor and short-sale pages use output2/stck_bsop_date; lending uses output1/bsop_date.
+        for r in (j.get("output2") or []) + (j.get("output1") or [] if isinstance(j.get("output1"), list) else []):
+            d = r.get("stck_bsop_date") or r.get("bsop_date")
             if d:
                 out.add(d)
     return out

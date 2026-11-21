@@ -35,6 +35,8 @@ const INVESTOR_DAILY_PATH: &str =
 const INVESTOR_DAILY_TR_ID: &str = "FHPTJ04160001";
 const SHORT_SALE_DAILY_PATH: &str = "/uapi/domestic-stock/v1/quotations/daily-short-sale";
 const SHORT_SALE_DAILY_TR_ID: &str = "FHPST04830000";
+const LENDING_DAILY_PATH: &str = "/uapi/domestic-stock/v1/quotations/daily-loan-trans";
+const LENDING_DAILY_TR_ID: &str = "HHPST074500C0";
 // Read-only market-data endpoints; order and account APIs live under other prefixes.
 pub const QUOTATIONS_PREFIX: &str = "/uapi/domestic-stock/v1/quotations/";
 const INDEX_CHART_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice";
@@ -44,6 +46,9 @@ pub const INDEX_HISTORY_ROOT: &str = "data/raw/kis_index";
 pub const SHORT_SALE_ROOT: &str = "data/raw/kis_short_sale";
 // The short-sale endpoint returns at most this many sessions per call, newest first.
 const SHORT_SALE_PAGE_CAP: usize = 100;
+pub const LENDING_ROOT: &str = "data/raw/kis_lending";
+// The lending endpoint returns at most this many sessions per call, newest first.
+const LENDING_PAGE_CAP: usize = 100;
 // The index chart returns at most this many rows per call, newest first.
 const INDEX_PAGE_CAP: usize = 50;
 // Calendar days per index request; at most 44 sessions, under the 50-row cap.
@@ -316,6 +321,27 @@ impl KisClient {
             ("FID_PERIOD_DIV_CODE", "D"),
         ];
         self.fetch_daily(INDEX_CHART_PATH, INDEX_CHART_TR_ID, &query)
+            .await
+    }
+
+    /// Raw JSON body of daily stock-lending activity and balances for one code between
+    /// two dates, inclusive (rows in `output1`).
+    pub async fn fetch_lending_daily(
+        &mut self,
+        code: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<String, DataError> {
+        let d1 = from.format("%Y%m%d").to_string();
+        let d2 = to.format("%Y%m%d").to_string();
+        let query = [
+            ("MRKT_DIV_CLS_CODE", "3"),
+            ("MKSC_SHRN_ISCD", code),
+            ("START_DATE", d1.as_str()),
+            ("END_DATE", d2.as_str()),
+            ("CTS", ""),
+        ];
+        self.fetch_daily(LENDING_DAILY_PATH, LENDING_DAILY_TR_ID, &query)
             .await
     }
 
@@ -806,6 +832,112 @@ pub async fn collect_investor_daily(
     Ok((requests, rows))
 }
 
+/// One session of stock lending from the per-stock daily endpoint. A proxy for short
+/// interest, not the short-sale balance. `balance_amount` is in million KRW.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LendingDay {
+    pub date: NaiveDate,
+    pub balance_shares: f64,
+    pub balance_amount: f64,
+    pub new_shares: f64,
+    pub repaid_shares: f64,
+    pub volume: f64,
+    pub close: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LendingEnvelope {
+    #[serde(default)]
+    output1: Vec<serde_json::Value>,
+}
+
+pub fn parse_lending_daily(body: &str) -> Result<Vec<LendingDay>, DataError> {
+    let env: LendingEnvelope = serde_json::from_str(body)?;
+    let mut out = Vec::new();
+    for row in &env.output1 {
+        let raw_date = row.get("bsop_date").and_then(|v| v.as_str()).unwrap_or("");
+        if raw_date.is_empty() {
+            continue;
+        }
+        let date =
+            NaiveDate::parse_from_str(raw_date, "%Y%m%d").map_err(|_| DataError::InvalidField {
+                field: "bsop_date",
+                value: raw_date.to_owned(),
+            })?;
+        out.push(LendingDay {
+            date,
+            balance_shares: number(row, "rmnd_stcn")?,
+            balance_amount: number(row, "rmnd_amt")?,
+            new_shares: number(row, "new_stcn")?,
+            repaid_shares: number(row, "rdmp_stcn")?,
+            volume: number(row, "acml_vol")?,
+            close: number(row, "stck_prpr")?,
+        });
+    }
+    out.sort_by_key(|d| d.date);
+    out.dedup_by_key(|d| d.date);
+    Ok(out)
+}
+
+/// Walks back from `to` to `from` in pages of at most 100 sessions within
+/// `[from, end]`, storing each body once at `<root>/<code>/<end>.json`. A full page
+/// continues from the day before its oldest session; a short page ends the walk.
+pub async fn collect_lending_daily(
+    client: &mut KisClient,
+    root: &Path,
+    code: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<(usize, usize), DataError> {
+    let (mut requests, mut rows) = (0, 0);
+    let mut end = to;
+    while end >= from {
+        let path = root.join(code).join(format!("{end}.json"));
+        let body = if path.exists() {
+            fs::read_to_string(&path).map_err(|e| io(&path, e))?
+        } else {
+            let body = client.fetch_lending_daily(code, from, end).await?;
+            requests += 1;
+            let dir = path.parent().expect("lending path has a parent");
+            fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, &body).map_err(|e| io(&tmp, e))?;
+            fs::rename(&tmp, &path).map_err(|e| io(&path, e))?;
+            body
+        };
+        let days = parse_lending_daily(&body)?;
+        rows += days.len();
+        if days.len() < LENDING_PAGE_CAP {
+            break;
+        }
+        let Some(oldest) = days.first().map(|d| d.date).filter(|d| *d <= end) else {
+            break;
+        };
+        let Some(next) = oldest.pred_opt() else { break };
+        end = next;
+    }
+    Ok((requests, rows))
+}
+
+/// Every cached lending day for `code`, sorted, one per date.
+pub fn load_lending_daily(root: &Path, code: &str) -> Result<Vec<LendingDay>, DataError> {
+    let dir = root.join(code);
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in read {
+        let path = item.map_err(|e| io(&dir, e))?.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            let text = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+            out.extend(parse_lending_daily(&text)?);
+        }
+    }
+    out.sort_by_key(|d| d.date);
+    out.dedup_by_key(|d| d.date);
+    Ok(out)
+}
+
 /// True only for paths under the read-only quotations prefix.
 pub fn is_quotation_path(path: &str) -> bool {
     path.starts_with(QUOTATIONS_PREFIX) && !path.contains("..") && !path.contains('?')
@@ -1157,6 +1289,24 @@ mod tests {
         assert!(!is_quotation_path(
             "/uapi/domestic-stock/v1/quotations/../trading/order-cash"
         ));
+    }
+
+    #[test]
+    fn parses_daily_lending_pages_oldest_first() {
+        let body = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":[
+            {"bsop_date":"20241230","stck_prpr":"53200.00","acml_vol":"12624702","new_stcn":"482242","rdmp_stcn":"2360106","rmnd_stcn":"121308503","rmnd_amt":"6453612"},
+            {"bsop_date":"20241227","stck_prpr":"53700.00","acml_vol":"0","new_stcn":"0","rdmp_stcn":"","rmnd_stcn":"3750","rmnd_amt":"0"}
+        ],"output2":[]}"#;
+        let days = parse_lending_daily(body).expect("parses");
+        assert_eq!(days.len(), 2);
+        assert_eq!(
+            days[0].date,
+            NaiveDate::from_ymd_opt(2024, 12, 27).expect("date")
+        );
+        assert_eq!(days[0].repaid_shares, 0.0);
+        assert_eq!(days[1].balance_amount, 6_453_612.0);
+        assert_eq!(days[1].close, 53_200.0);
+        assert_eq!(days[1].new_shares, 482_242.0);
     }
 
     #[test]

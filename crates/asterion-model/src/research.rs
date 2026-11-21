@@ -226,6 +226,8 @@ pub enum Candidate {
     GbdtShort,
     // Trial 7 (README pre-registration): gbdt scores held through a rank buffer.
     GbdtBuffer,
+    // Trial 8 (README pre-registration): gbdt on base plus stock-lending columns.
+    GbdtLending,
 }
 
 impl Candidate {
@@ -254,6 +256,7 @@ impl Candidate {
             Candidate::GbdtFlow => "gbdt_flow",
             Candidate::GbdtShort => "gbdt_short",
             Candidate::GbdtBuffer => "gbdt_buffer",
+            Candidate::GbdtLending => "gbdt_lending",
         }
     }
 
@@ -266,6 +269,9 @@ impl Candidate {
         }
         if !short_columns(panel).is_empty() {
             out.push(Candidate::GbdtShort);
+        }
+        if !lending_columns(panel).is_empty() {
+            out.push(Candidate::GbdtLending);
         }
         out
     }
@@ -307,11 +313,22 @@ pub fn short_columns(panel: &Panel) -> Vec<usize> {
         .collect()
 }
 
-/// Columns before the first flow or short-sale column (base plus title topics).
+/// Name prefix of the stock-lending columns appended after the title-topic columns.
+pub const LENDING_PREFIX: &str = "lending_";
+
+/// Panel columns of the stock-lending features.
+pub fn lending_columns(panel: &Panel) -> Vec<usize> {
+    (0..panel.names.len())
+        .filter(|&j| panel.names[j].starts_with(LENDING_PREFIX))
+        .collect()
+}
+
+/// Columns before the first flow, short-sale or lending column (base plus title topics).
 fn pre_flow_width(panel: &Panel) -> usize {
     flow_columns(panel)
         .into_iter()
         .chain(short_columns(panel))
+        .chain(lending_columns(panel))
         .min()
         .unwrap_or(panel.names.len())
 }
@@ -364,11 +381,11 @@ pub fn fit(candidate: Candidate, panel: &Panel, train: &[usize], k: usize) -> Sc
             pre_flow_width(panel),
             &GbdtParams::default(),
         )),
-        Candidate::GbdtFlow | Candidate::GbdtShort => {
-            let added = if candidate == Candidate::GbdtFlow {
-                flow_columns(panel)
-            } else {
-                short_columns(panel)
+        Candidate::GbdtFlow | Candidate::GbdtShort | Candidate::GbdtLending => {
+            let added = match candidate {
+                Candidate::GbdtFlow => flow_columns(panel),
+                Candidate::GbdtShort => short_columns(panel),
+                _ => lending_columns(panel),
             };
             let cols: Vec<usize> = (0..p).chain(added).collect();
             Scorer::Trees(Gbdt::fit_columns(
@@ -1086,6 +1103,8 @@ pub const FLOW_MIN_T: f64 = 2.6;
 pub const SHORT_MIN_T: f64 = 2.7;
 // Pre-registered threshold for the seventh trial (holding buffer vs gbdt).
 pub const BUFFER_MIN_T: f64 = 2.8;
+// Pre-registered threshold for the eighth trial (stock lending vs gbdt).
+pub const LENDING_MIN_T: f64 = 2.9;
 
 struct Run {
     ics: Vec<(NaiveDate, f64)>,
@@ -1217,12 +1236,14 @@ pub fn run_cv_with(
                     | Candidate::GbdtFlow
                     | Candidate::GbdtShort
                     | Candidate::GbdtBuffer
+                    | Candidate::GbdtLending
             ) {
                 let vs = format!("{}_vs_gbdt", c.id());
                 let min_t = match c {
                     Candidate::GbdtFlow => FLOW_MIN_T,
                     Candidate::GbdtShort => SHORT_MIN_T,
                     Candidate::GbdtBuffer => BUFFER_MIN_T,
+                    Candidate::GbdtLending => LENDING_MIN_T,
                     _ => ADDENDUM_MIN_T,
                 };
                 let gi = candidates

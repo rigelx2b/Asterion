@@ -131,6 +131,10 @@ enum Command {
     )]
     FetchShortSaleHistory(FetchShortSaleHistoryArgs),
     #[command(
+        about = "Fetch uncached per-stock daily stock-lending activity and balances (short-interest proxy) from KIS API into raw cache (resumable)"
+    )]
+    FetchLendingHistory(FetchLendingHistoryArgs),
+    #[command(
         about = "Fetch uncached per-stock daily investor flows (foreign, institution, individual) from KIS API into raw cache (resumable)"
     )]
     FetchInvestorHistory(FetchInvestorHistoryArgs),
@@ -306,6 +310,21 @@ struct FetchInvestorHistoryArgs {
     to: NaiveDate,
 
     #[arg(long, default_value = kis::INVESTOR_DAILY_ROOT, help = "Directory for raw KIS per-stock daily investor flow responses")]
+    root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct FetchLendingHistoryArgs {
+    #[command(flatten)]
+    universe: UniverseArgs,
+
+    #[arg(long, value_parser = parse_date, default_value = "2019-10-01", help = "Earliest session date to collect, inclusive (default adds pre-2020 warm-up)")]
+    from: NaiveDate,
+
+    #[arg(long, value_parser = parse_date, default_value = "2024-12-31", help = "Latest request date, inclusive (default covers walk-forward test folds)")]
+    to: NaiveDate,
+
+    #[arg(long, default_value = kis::LENDING_ROOT, help = "Cache directory for raw KIS per-stock daily stock-lending responses")]
     root: PathBuf,
 }
 
@@ -561,6 +580,20 @@ struct ResearchCvArgs {
         help = "Directory of cached KIS per-stock daily short-sale trading responses (read only with --with-short-sale)"
     )]
     short_sale_root: PathBuf,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["with_history", "with_flows", "with_short_sale"],
+        help = "Append stock-lending balance features (balance over mean 20-session trading value and 20-session net new lending over trading value; short-interest proxy, up to the second-latest prior session) and add the gbdt_lending arm against gbdt (incompatible with --with-history, --with-flows, and --with-short-sale)"
+    )]
+    with_lending: bool,
+
+    #[arg(
+        long,
+        default_value = kis::LENDING_ROOT,
+        help = "Directory of cached KIS per-stock daily stock-lending responses (read only with --with-lending)"
+    )]
+    lending_root: PathBuf,
 
     #[arg(
         long,
@@ -1106,6 +1139,11 @@ async fn main() -> ExitCode {
         Command::FetchShortSaleHistory(args) => {
             let mut progress = ProgressTracker::start(&dir, "fetch-short-sale-history");
             let result = fetch_short_sale_history(args, &mut progress).await;
+            finish(progress, result)
+        }
+        Command::FetchLendingHistory(args) => {
+            let mut progress = ProgressTracker::start(&dir, "fetch-lending-history");
+            let result = fetch_lending_history(args, &mut progress).await;
             finish(progress, result)
         }
         Command::FetchInvestorHistory(args) => {
@@ -2134,6 +2172,7 @@ const KIS_INDEX_CODES: [&str; 2] = ["0001", "1001"];
 enum KisDaily {
     Investor,
     ShortSale,
+    Lending,
 }
 
 // One worker's share of a per-stock KIS history fetch: (requests, rows, failures).
@@ -2153,6 +2192,7 @@ async fn investor_worker(
             KisDaily::ShortSale => {
                 kis::collect_short_sale_daily(client, root, code, from, to).await
             }
+            KisDaily::Lending => kis::collect_lending_daily(client, root, code, from, to).await,
         };
         match result {
             Ok((r, n)) => {
@@ -2190,6 +2230,23 @@ async fn fetch_investor_history(
     )
     .await?;
     println!("fetch_investor_history_done {summary}");
+    Ok(code)
+}
+
+async fn fetch_lending_history(
+    args: FetchLendingHistoryArgs,
+    progress: &mut ProgressTracker,
+) -> CliResult<ExitCode> {
+    let (summary, code) = fetch_kis_daily_history(
+        &args.universe,
+        &args.root,
+        args.from,
+        args.to,
+        KisDaily::Lending,
+        progress,
+    )
+    .await?;
+    println!("fetch_lending_history_done {summary}");
     Ok(code)
 }
 
@@ -2755,6 +2812,36 @@ fn coverage_counts(
     Ok((n, hit, sn, shit))
 }
 
+// Loads cached stock lending and prints liquid-row coverage over the pre-registered
+// window (same as the short-sale trial), overall and for names that stop trading early.
+fn load_lending(
+    root: &Path,
+    symbols: &[Symbol],
+    samples: &[asterion_model::features::Sample],
+) -> CliResult<asterion_model::lending::LendingIndex> {
+    let mut index = asterion_model::lending::LendingIndex::default();
+    for symbol in symbols {
+        let days = kis::load_lending_daily(root, symbol.code())?;
+        if !days.is_empty() {
+            index.insert(symbol.code(), &days);
+        }
+    }
+    let (y, m, d) = FLOW_COVERAGE_FROM;
+    let from = NaiveDate::from_ymd_opt(y, m, d).ok_or("invalid coverage date")?;
+    let (y, m, d) = SHORT_COVERAGE_TO;
+    let to = NaiveDate::from_ymd_opt(y, m, d).ok_or("invalid coverage date")?;
+    let (n, hit, sn, shit) =
+        coverage_counts(samples, from, to, &|code, date| index.covers(code, date))?;
+    let share = |a: usize, b: usize| a as f64 / b.max(1) as f64;
+    println!(
+        "lending codes={} liquid_rows_from={from} to={to} rows={n} covered={:.4} stopped_rows={sn} stopped_covered={:.4}",
+        index.len(),
+        share(hit, n),
+        share(shit, sn)
+    );
+    Ok(index)
+}
+
 // Loads cached short-sale trading and prints liquid-row coverage over the pre-registered
 // window, overall and for names whose bars stop before the data end.
 fn load_short_sale(
@@ -3085,8 +3172,17 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
     if args.with_short_sale {
         extra_names.extend_from_slice(&asterion_model::shorts::SHORT_FEATURE_NAMES);
     }
+    let lending = if args.with_lending {
+        load_lending(&args.lending_root, &symbols, &samples)?
+    } else {
+        asterion_model::lending::LendingIndex::default()
+    };
+    if args.with_lending {
+        extra_names.extend_from_slice(&asterion_model::lending::LENDING_FEATURE_NAMES);
+    }
     let with_flows = args.with_flows;
     let with_short_sale = args.with_short_sale;
+    let with_lending = args.with_lending;
     let extras = |code: &str, date: NaiveDate| {
         let mut v = context.disclosures.topic_features(code, date).to_vec();
         if with_flows {
@@ -3094,6 +3190,9 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
         }
         if with_short_sale {
             v.extend_from_slice(&shorts.features(code, date));
+        }
+        if with_lending {
+            v.extend_from_slice(&lending.features(code, date));
         }
         v
     };

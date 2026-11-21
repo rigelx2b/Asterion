@@ -16,6 +16,7 @@ pub mod fundamentals;
 pub mod history;
 mod labels;
 pub mod ledger;
+pub mod lending;
 pub mod metrics;
 pub mod neural;
 pub mod predict;
