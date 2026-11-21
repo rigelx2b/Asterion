@@ -224,6 +224,8 @@ pub enum Candidate {
     GbdtFlow,
     // Trial 6 (README pre-registration): gbdt on base plus short-sale trading columns.
     GbdtShort,
+    // Trial 7 (README pre-registration): gbdt scores held through a rank buffer.
+    GbdtBuffer,
 }
 
 impl Candidate {
@@ -251,6 +253,7 @@ impl Candidate {
             Candidate::GbdtDart => "gbdt_dart",
             Candidate::GbdtFlow => "gbdt_flow",
             Candidate::GbdtShort => "gbdt_short",
+            Candidate::GbdtBuffer => "gbdt_buffer",
         }
     }
 
@@ -266,6 +269,22 @@ impl Candidate {
         }
         out
     }
+
+    /// `for_panel` plus the opt-in portfolio-rule arms.
+    pub fn for_run(panel: &Panel, opts: CvOptions) -> Vec<Candidate> {
+        let mut out = Self::for_panel(panel);
+        if opts.holding_buffer {
+            out.push(Candidate::GbdtBuffer);
+        }
+        out
+    }
+}
+
+/// Opt-in arms of a CV run that are not implied by the panel's columns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CvOptions {
+    /// Adds `gbdt_buffer`: gbdt scores with holdings kept while inside `BUFFER_BAND`.
+    pub holding_buffer: bool,
 }
 
 /// Name prefix of the investor-flow columns appended after the title-topic columns.
@@ -334,7 +353,10 @@ pub fn fit(candidate: Candidate, panel: &Panel, train: &[usize], k: usize) -> Sc
         Candidate::ControlLowvol => fixed(&[(CONTROL, -1.0)]),
         Candidate::Composite6 => fixed(&COMPOSITE),
         Candidate::Ridge => fit_ridge(panel, train, k, p),
-        Candidate::Gbdt => Scorer::Trees(Gbdt::fit(panel, train, k, p, &GbdtParams::default())),
+        // The buffer arm changes only portfolio construction, so it scores like gbdt.
+        Candidate::Gbdt | Candidate::GbdtBuffer => {
+            Scorer::Trees(Gbdt::fit(panel, train, k, p, &GbdtParams::default()))
+        }
         Candidate::GbdtDart => Scorer::Trees(Gbdt::fit(
             panel,
             train,
@@ -748,6 +770,112 @@ fn equal_weights<'a>(names: impl Iterator<Item = &'a str>) -> HashMap<&'a str, f
     v.into_iter().map(|s| (s, w)).collect()
 }
 
+/// Pre-registered rank band of the seventh trial: a holding stays while its score rank is
+/// within this top fraction of the date's names.
+pub const BUFFER_BAND: f64 = 0.2;
+
+/// Like `evaluate` (entry at the close, no skip), except that each chain keeps previous
+/// holdings whose score rank is within the top `band` fraction of the date's names; free
+/// slots take the best-scored names not held. The holding count stays `TOP_FRACTION`.
+pub fn evaluate_buffered(
+    panel: &Panel,
+    test: &[usize],
+    scores: &[f64],
+    k: usize,
+    band: f64,
+) -> (Vec<(NaiveDate, f64)>, Vec<PeriodRecord>) {
+    let h_idx = CV_HORIZONS[k];
+    let horizon = HORIZONS[h_idx];
+    let mut dates: Vec<(NaiveDate, Vec<usize>)> = Vec::new();
+    for (pos, &i) in test.iter().enumerate() {
+        let d = panel.rows[i].date;
+        match dates.last_mut() {
+            Some((last, v)) if *last == d => v.push(pos),
+            _ => dates.push((d, vec![pos])),
+        }
+    }
+    let mut ics = Vec::new();
+    // Per date, test positions sorted by descending score (ties keep panel order).
+    let mut orders: Vec<Vec<usize>> = Vec::with_capacity(dates.len());
+    for (d, members) in &dates {
+        let s: Vec<f64> = members.iter().map(|&q| scores[q]).collect();
+        let sr = centered_ranks(&s);
+        let yr: Vec<f64> = members
+            .iter()
+            .map(|&q| f64::from(panel.rows[test[q]].y[k]))
+            .collect();
+        ics.push((*d, pearson(&sr, &yr)));
+        let mut order: Vec<usize> = (0..members.len()).collect();
+        order.sort_by(|&a, &b| s[b].total_cmp(&s[a]));
+        orders.push(order.into_iter().map(|o| members[o]).collect());
+    }
+    let symbol = |q: usize| panel.rows[test[q]].symbol.as_str();
+    let mut records = Vec::new();
+    for offset in 0..horizon.min(dates.len()) {
+        let mut prev_top: Option<HashMap<&str, f64>> = None;
+        let mut prev_bench: Option<HashMap<&str, f64>> = None;
+        let mut t = offset;
+        while t < dates.len() {
+            let (d, members) = &dates[t];
+            let order = &orders[t];
+            let n = order.len();
+            let take = ((n as f64) * TOP_FRACTION).ceil() as usize;
+            let width = (((n as f64) * band).ceil() as usize).min(n);
+            let mut chosen = vec![false; n];
+            let mut count = 0;
+            if let Some(prev) = &prev_top {
+                for (p, &q) in order.iter().enumerate().take(width) {
+                    if count < take && prev.contains_key(symbol(q)) {
+                        chosen[p] = true;
+                        count += 1;
+                    }
+                }
+            }
+            for c in chosen.iter_mut() {
+                if count >= take {
+                    break;
+                }
+                if !*c {
+                    *c = true;
+                    count += 1;
+                }
+            }
+            // Held names in score order, so a band equal to TOP_FRACTION matches `evaluate`.
+            let held: Vec<usize> = order
+                .iter()
+                .zip(&chosen)
+                .filter(|(_, c)| **c)
+                .map(|(&q, _)| q)
+                .collect();
+            let top = equal_weights(held.iter().map(|&q| symbol(q)));
+            let bench = equal_weights(members.iter().map(|&q| symbol(q)));
+            let ret = |w: &HashMap<&str, f64>, set: &[usize]| -> f64 {
+                set.iter()
+                    .map(|&q| {
+                        w.get(symbol(q)).copied().unwrap_or(0.0) * panel.rows[test[q]].ret[h_idx]
+                    })
+                    .sum()
+            };
+            let tt = prev_top.as_ref().map_or(0.0, |p| one_way_turnover(p, &top));
+            let tb = prev_bench
+                .as_ref()
+                .map_or(0.0, |p| one_way_turnover(p, &bench));
+            records.push(PeriodRecord {
+                date: *d,
+                offset,
+                top_net: ret(&top, &held) - tt * COST,
+                bench_net: ret(&bench, members) - tb * COST,
+                turnover: tt,
+                bench_turnover: tb,
+            });
+            prev_top = Some(top);
+            prev_bench = Some(bench);
+            t += horizon;
+        }
+    }
+    (ics, records)
+}
+
 /// Per-date IC and every-offset top-decile chains over the test rows (sorted by date).
 pub fn evaluate(
     panel: &Panel,
@@ -956,38 +1084,65 @@ pub const ADDENDUM_MIN_T: f64 = 2.5;
 pub const FLOW_MIN_T: f64 = 2.6;
 // Pre-registered threshold for the sixth trial (short-sale trading vs gbdt).
 pub const SHORT_MIN_T: f64 = 2.7;
+// Pre-registered threshold for the seventh trial (holding buffer vs gbdt).
+pub const BUFFER_MIN_T: f64 = 2.8;
 
 struct Run {
     ics: Vec<(NaiveDate, f64)>,
     records: Vec<PeriodRecord>,
 }
 
-fn run_fold(panel: &Panel, fold: Fold, embargo: u64, k: usize, log: &dyn Fn(&str)) -> Vec<Run> {
+fn run_fold(
+    panel: &Panel,
+    fold: Fold,
+    embargo: u64,
+    k: usize,
+    opts: CvOptions,
+    log: &dyn Fn(&str),
+) -> Vec<Run> {
     let (train, test) = split(panel, fold, embargo);
-    Candidate::for_panel(panel)
-        .iter()
-        .map(|&c| {
-            let scorer = fit(c, panel, &train, k);
-            let scores: Vec<f64> = par_chunks(&test, |part| {
-                part.iter()
-                    .map(|&i| scorer.score(&panel.rows[i].x))
-                    .collect::<Vec<_>>()
-            })
-            .into_iter()
-            .flatten()
-            .collect();
-            let (ics, records) = evaluate(panel, &test, &scores, k, false);
-            log(&format!(
-                "fold={} h={} candidate={} train={} test={}",
-                fold.test_from,
-                HORIZONS[CV_HORIZONS[k]],
-                c.id(),
-                train.len(),
-                test.len()
-            ));
-            Run { ics, records }
-        })
-        .collect()
+    let mut gbdt_scores: Option<Vec<f64>> = None;
+    let mut runs = Vec::new();
+    for c in Candidate::for_run(panel, opts) {
+        // The buffer arm reuses this fold's gbdt scores instead of refitting.
+        let reused = if c == Candidate::GbdtBuffer {
+            gbdt_scores.clone()
+        } else {
+            None
+        };
+        let scores = match reused {
+            Some(s) => s,
+            None => {
+                let scorer = fit(c, panel, &train, k);
+                par_chunks(&test, |part| {
+                    part.iter()
+                        .map(|&i| scorer.score(&panel.rows[i].x))
+                        .collect::<Vec<_>>()
+                })
+                .into_iter()
+                .flatten()
+                .collect()
+            }
+        };
+        let (ics, records) = if c == Candidate::GbdtBuffer {
+            evaluate_buffered(panel, &test, &scores, k, BUFFER_BAND)
+        } else {
+            evaluate(panel, &test, &scores, k, false)
+        };
+        if c == Candidate::Gbdt {
+            gbdt_scores = Some(scores);
+        }
+        log(&format!(
+            "fold={} h={} candidate={} train={} test={}",
+            fold.test_from,
+            HORIZONS[CV_HORIZONS[k]],
+            c.id(),
+            train.len(),
+            test.len()
+        ));
+        runs.push(Run { ics, records });
+    }
+    runs
 }
 
 pub fn run_cv(
@@ -997,15 +1152,26 @@ pub fn run_cv(
     embargo: u64,
     log: &dyn Fn(&str),
 ) -> CvReport {
+    run_cv_with(panel, folds, burnt, embargo, CvOptions::default(), log)
+}
+
+pub fn run_cv_with(
+    panel: &Panel,
+    folds: &[Fold],
+    burnt: Option<Fold>,
+    embargo: u64,
+    opts: CvOptions,
+    log: &dyn Fn(&str),
+) -> CvReport {
     let mut dev = Vec::new();
     let mut burnt_out = Vec::new();
     let mut verdicts = Vec::new();
-    let candidates = Candidate::for_panel(panel);
+    let candidates = Candidate::for_run(panel, opts);
     for (k, &h_idx) in CV_HORIZONS.iter().enumerate() {
         let horizon = HORIZONS[h_idx];
         let per_fold: Vec<Vec<Run>> = folds
             .iter()
-            .map(|&f| run_fold(panel, f, embargo, k, log))
+            .map(|&f| run_fold(panel, f, embargo, k, opts, log))
             .collect();
         for (ci, c) in candidates.iter().enumerate() {
             let mut ics = Vec::new();
@@ -1044,15 +1210,19 @@ pub fn run_cv(
                 });
             }
             dev.push(pooled);
-            // Addenda: the title-topic, flow and short-sale trials are judged against gbdt.
+            // Addenda: the title-topic, flow, short-sale and buffer trials are judged against gbdt.
             if matches!(
                 c,
-                Candidate::GbdtDart | Candidate::GbdtFlow | Candidate::GbdtShort
+                Candidate::GbdtDart
+                    | Candidate::GbdtFlow
+                    | Candidate::GbdtShort
+                    | Candidate::GbdtBuffer
             ) {
                 let vs = format!("{}_vs_gbdt", c.id());
                 let min_t = match c {
                     Candidate::GbdtFlow => FLOW_MIN_T,
                     Candidate::GbdtShort => SHORT_MIN_T,
+                    Candidate::GbdtBuffer => BUFFER_MIN_T,
                     _ => ADDENDUM_MIN_T,
                 };
                 let gi = candidates
@@ -1091,7 +1261,7 @@ pub fn run_cv(
             }
         }
         if let Some(b) = burnt {
-            let runs = run_fold(panel, b, embargo, k, log);
+            let runs = run_fold(panel, b, embargo, k, opts, log);
             for (ci, c) in candidates.iter().enumerate() {
                 burnt_out.push(summarize(
                     c.id(),
@@ -1257,6 +1427,67 @@ fn decile_returns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 40 dates x 20 names whose scores drift slowly, plus their scores in test order.
+    fn buffer_fixture() -> (Panel, Vec<usize>, Vec<f64>) {
+        let (days, names) = (40u64, 20usize);
+        let mut rows = Vec::new();
+        let mut groups = Vec::new();
+        let mut scores = Vec::new();
+        for d in 0..days {
+            let date = NaiveDate::from_ymd_opt(2024, 1, 1)
+                .and_then(|x| x.checked_add_days(chrono::Days::new(d)))
+                .expect("date");
+            let first = rows.len();
+            for i in 0..names {
+                let wobble = ((i as u64 * 13 + d * 7) % 11) as f64 / 2.0;
+                scores.push(i as f64 + wobble);
+                rows.push(Row {
+                    symbol: format!("S{i:02}"),
+                    date,
+                    target_end: date,
+                    x: vec![0.0],
+                    ret: vec![((i as u64 * 13 + d * 5) % 17) as f64 / 100.0 - 0.08; HORIZONS.len()],
+                    y: [i as f32; 3],
+                });
+            }
+            groups.push((date, first, rows.len()));
+        }
+        let test: Vec<usize> = (0..rows.len()).collect();
+        let panel = Panel {
+            names: vec!["f"],
+            base_cols: 1,
+            rows,
+            groups,
+        };
+        (panel, test, scores)
+    }
+
+    #[test]
+    fn buffer_as_wide_as_the_holdings_matches_plain_top_decile() {
+        let (panel, test, scores) = buffer_fixture();
+        let (ics, plain) = evaluate(&panel, &test, &scores, 0, false);
+        let (ics_b, buffered) = evaluate_buffered(&panel, &test, &scores, 0, TOP_FRACTION);
+        assert_eq!(ics, ics_b);
+        assert_eq!(plain.len(), buffered.len());
+        for (a, b) in plain.iter().zip(&buffered) {
+            assert_eq!((a.date, a.offset), (b.date, b.offset));
+            assert!((a.top_net - b.top_net).abs() < 1e-12);
+            assert!((a.bench_net - b.bench_net).abs() < 1e-12);
+            assert!((a.turnover - b.turnover).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn buffer_lowers_turnover_on_slowly_drifting_scores() {
+        let (panel, test, scores) = buffer_fixture();
+        let (_, plain) = evaluate(&panel, &test, &scores, 0, false);
+        let (_, buffered) = evaluate_buffered(&panel, &test, &scores, 0, BUFFER_BAND);
+        let total = |r: &[PeriodRecord]| r.iter().map(|p| p.turnover).sum::<f64>();
+        // A Python replay of both rules on this fixture gives 13.0 and 2.0.
+        assert!((total(&plain) - 13.0).abs() < 1e-9);
+        assert!((total(&buffered) - 2.0).abs() < 1e-9);
+    }
 
     #[test]
     fn ranks_average_ties_and_center() {

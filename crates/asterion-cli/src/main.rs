@@ -118,9 +118,13 @@ enum Command {
         about = "Probe KIS daily stock investor-trade quotes and print row counts, date range, and fields without caching"
     )]
     ProbeInvestorDaily(ProbeInvestorDailyArgs),
-    #[command(about = "Probe KIS daily short-sale trading data and print row counts, date range, and fields without caching")]
+    #[command(
+        about = "Probe KIS daily short-sale trading data and print row counts, date range, and fields without caching"
+    )]
     ProbeShortSale(ProbeShortSaleArgs),
-    #[command(about = "Fetch uncached per-stock daily short-sale trading (volume and value, not balances) from KIS API into raw cache (resumable)")]
+    #[command(
+        about = "Fetch uncached per-stock daily short-sale trading (volume and value, not balances) from KIS API into raw cache (resumable)"
+    )]
     FetchShortSaleHistory(FetchShortSaleHistoryArgs),
     #[command(
         about = "Fetch uncached per-stock daily investor flows (foreign, institution, individual) from KIS API into raw cache (resumable)"
@@ -531,6 +535,12 @@ struct ResearchCvArgs {
         help = "Directory of cached KIS per-stock daily short-sale trading responses (read only with --with-short-sale)"
     )]
     short_sale_root: PathBuf,
+
+    #[arg(
+        long,
+        help = "Add the gbdt_buffer arm against gbdt (portfolio construction only: keep prior holdings within the top 20% gbdt score rank and fill remaining top-decile slots by score)"
+    )]
+    holding_buffer: bool,
 
     #[arg(
         long,
@@ -2279,7 +2289,10 @@ async fn probe_short_sale(args: ProbeShortSaleArgs) -> CliResult<ExitCode> {
     };
     let mut client = KisClient::new(KisKeys::from_env()?, kis::BASE_URL, policy)?;
     for code in &args.symbols {
-        match client.fetch_short_sale_daily(code, args.from, args.to).await {
+        match client
+            .fetch_short_sale_daily(code, args.from, args.to)
+            .await
+        {
             Ok(body) => {
                 let v: serde_json::Value = serde_json::from_str(&body)?;
                 let rows = v["output2"].as_array().cloned().unwrap_or_default();
@@ -2918,7 +2931,7 @@ fn run_audits(
 }
 
 fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResult<ExitCode> {
-    use asterion_model::research::{Fold, Panel, run_cv};
+    use asterion_model::research::{CvOptions, Fold, Panel, run_cv_with};
     let cache = RawCache::new(&args.universe.cache_dir);
     let symbols = resolve_symbols(&args.universe, &cache)?;
     let mut context = args.context.load()?;
@@ -3077,7 +3090,10 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
         return Ok(ExitCode::SUCCESS);
     }
     progress.stage("cross-validation", 0);
-    let report = run_cv(&panel, &folds, burnt, args.embargo_days, &|line| {
+    let opts = CvOptions {
+        holding_buffer: args.holding_buffer,
+    };
+    let report = run_cv_with(&panel, &folds, burnt, args.embargo_days, opts, &|line| {
         println!("{line}")
     });
     for s in report.dev.iter().chain(&report.burnt) {
