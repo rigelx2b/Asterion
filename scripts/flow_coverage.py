@@ -48,6 +48,7 @@ def main() -> int:
     ap.add_argument("--from", dest="lo", default="20191001")
     ap.add_argument("--to", dest="hi", default="20241231")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--cache", default="data/raw/kis_investor_daily")
     a = ap.parse_args()
     os.chdir(a.repo)
     codes = [l.split("#")[0].strip() for l in open("config/universe/kr-union.txt", encoding="utf-8")]
@@ -60,7 +61,7 @@ def main() -> int:
         traded, last = dgk_sessions("data/raw/data_go_kr", code, a.lo, a.hi)
         if not traded:
             continue
-        flows = flow_sessions("data/raw/kis_investor_daily", code)
+        flows = flow_sessions(a.cache, code)
         if not flows:
             no_cache.append(code)
         miss = traded - flows
