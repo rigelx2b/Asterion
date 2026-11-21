@@ -107,6 +107,10 @@ enum Command {
     )]
     RankFit(RankLedgerArgs),
     #[command(
+        about = "Fit one h20 GBDT scorer on labelled history, freeze by fingerprint, and register the forward-only paper ledger for the 20% holding buffer"
+    )]
+    BufferLedgerFit(BufferLedgerFitArgs),
+    #[command(
         about = "Fetch uncached historical daily bars per stock from KIS daily chart API into raw cache (resumable)"
     )]
     FetchHistory(FetchHistoryArgs),
@@ -418,6 +422,22 @@ struct FetchOverseasArgs {
 
     #[arg(long, default_value = kis::OVERSEAS_ROOT, help = "Directory for raw KIS overseas daily price responses")]
     root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct BufferLedgerFitArgs {
+    #[command(flatten)]
+    universe: UniverseArgs,
+
+    #[command(flatten)]
+    context: ContextArgs,
+
+    #[arg(
+        long,
+        default_value = asterion_model::rank_ledger::BUFFER_DIR,
+        help = "Directory for the forward-only holding-buffer paper ledger (hypothesis, frozen model, and daily entries)"
+    )]
+    dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -1126,6 +1146,11 @@ async fn main() -> ExitCode {
         Command::RankFit(args) => {
             let mut progress = ProgressTracker::start(&dir, "rank-fit");
             let result = rank_fit(args, &mut progress);
+            finish(progress, result)
+        }
+        Command::BufferLedgerFit(args) => {
+            let mut progress = ProgressTracker::start(&dir, "buffer-ledger-fit");
+            let result = buffer_ledger_fit(args, &mut progress);
             finish(progress, result)
         }
         Command::RankRecord(args) => rank_record(args),
@@ -1939,6 +1964,25 @@ fn ledger_score(args: LedgerScoreArgs) -> CliResult<ExitCode> {
     let cache = RawCache::new(&args.cache_dir);
     let score = asterion_model::ledger::score(&args.model, &cache, &args.ledger_root)?;
     asterion_model::ledger::print_score(&score);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn buffer_ledger_fit(
+    args: BufferLedgerFitArgs,
+    progress: &mut ProgressTracker,
+) -> CliResult<ExitCode> {
+    let cache = RawCache::new(&args.universe.cache_dir);
+    let symbols = resolve_symbols(&args.universe, &cache)?;
+    let context = args.context.load()?;
+    let (samples, _) = asterion_model::train::load_samples(&cache, &symbols, &context, progress)?;
+    let panel = asterion_model::research::Panel::build(samples);
+    progress.stage("fitting", 0);
+    let fp = asterion_model::rank_ledger::fit_and_register_buffer(&panel, &args.dir)?;
+    println!(
+        "rows={} fingerprint={fp} dir={}",
+        panel.rows.len(),
+        args.dir.display()
+    );
     Ok(ExitCode::SUCCESS)
 }
 
