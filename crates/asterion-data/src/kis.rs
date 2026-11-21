@@ -33,10 +33,15 @@ const CHART_TR_ID: &str = "FHKST03010100";
 const INVESTOR_DAILY_PATH: &str =
     "/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily";
 const INVESTOR_DAILY_TR_ID: &str = "FHPTJ04160001";
+const SHORT_SALE_DAILY_PATH: &str = "/uapi/domestic-stock/v1/quotations/daily-short-sale";
+const SHORT_SALE_DAILY_TR_ID: &str = "FHPST04830000";
 const INDEX_CHART_PATH: &str = "/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice";
 const INDEX_CHART_TR_ID: &str = "FHKUP03500100";
 pub const INVESTOR_DAILY_ROOT: &str = "data/raw/kis_investor_daily";
 pub const INDEX_HISTORY_ROOT: &str = "data/raw/kis_index";
+pub const SHORT_SALE_ROOT: &str = "data/raw/kis_short_sale";
+// The short-sale endpoint returns at most this many sessions per call, newest first.
+const SHORT_SALE_PAGE_CAP: usize = 100;
 // The index chart returns at most this many rows per call, newest first.
 const INDEX_PAGE_CAP: usize = 50;
 // Calendar days per index request; at most 44 sessions, under the 50-row cap.
@@ -268,6 +273,26 @@ impl KisClient {
             ("FID_ETC_CLS_CODE", ""),
         ];
         self.fetch_daily(INVESTOR_DAILY_PATH, INVESTOR_DAILY_TR_ID, &query)
+            .await
+    }
+
+    /// Raw JSON body of daily short-sale trading (not balances) for one code between
+    /// two dates, inclusive.
+    pub async fn fetch_short_sale_daily(
+        &mut self,
+        code: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<String, DataError> {
+        let d1 = from.format("%Y%m%d").to_string();
+        let d2 = to.format("%Y%m%d").to_string();
+        let query = [
+            ("FID_COND_MRKT_DIV_CODE", "J"),
+            ("FID_INPUT_ISCD", code),
+            ("FID_INPUT_DATE_1", d1.as_str()),
+            ("FID_INPUT_DATE_2", d2.as_str()),
+        ];
+        self.fetch_daily(SHORT_SALE_DAILY_PATH, SHORT_SALE_DAILY_TR_ID, &query)
             .await
     }
 
@@ -762,6 +787,105 @@ pub async fn collect_investor_daily(
     Ok((requests, rows))
 }
 
+/// One session of short-sale trading (not balances) from the per-stock daily endpoint.
+/// `short_value` and `trading_value` are in KRW; quantities in shares.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ShortSaleDay {
+    pub date: NaiveDate,
+    pub short_qty: f64,
+    pub short_value: f64,
+    pub volume: f64,
+    pub trading_value: f64,
+}
+
+pub fn parse_short_sale_daily(body: &str) -> Result<Vec<ShortSaleDay>, DataError> {
+    let env: ChartEnvelope = serde_json::from_str(body)?;
+    let mut out = Vec::new();
+    for row in &env.output2 {
+        let raw_date = row
+            .get("stck_bsop_date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if raw_date.is_empty() {
+            continue;
+        }
+        let date =
+            NaiveDate::parse_from_str(raw_date, "%Y%m%d").map_err(|_| DataError::InvalidField {
+                field: "stck_bsop_date",
+                value: raw_date.to_owned(),
+            })?;
+        out.push(ShortSaleDay {
+            date,
+            short_qty: number(row, "ssts_cntg_qty")?,
+            short_value: number(row, "ssts_tr_pbmn")?,
+            volume: number(row, "acml_vol")?,
+            trading_value: number(row, "acml_tr_pbmn")?,
+        });
+    }
+    out.sort_by_key(|d| d.date);
+    out.dedup_by_key(|d| d.date);
+    Ok(out)
+}
+
+/// Walks back from `to` to `from` in pages of at most 100 sessions within
+/// `[from, end]`, storing each body once at `<root>/<code>/<end>.json`. A full page
+/// continues from the day before its oldest session; a short page ends the walk.
+pub async fn collect_short_sale_daily(
+    client: &mut KisClient,
+    root: &Path,
+    code: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<(usize, usize), DataError> {
+    let (mut requests, mut rows) = (0, 0);
+    let mut end = to;
+    while end >= from {
+        let path = root.join(code).join(format!("{end}.json"));
+        let body = if path.exists() {
+            fs::read_to_string(&path).map_err(|e| io(&path, e))?
+        } else {
+            let body = client.fetch_short_sale_daily(code, from, end).await?;
+            requests += 1;
+            let dir = path.parent().expect("short-sale path has a parent");
+            fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, &body).map_err(|e| io(&tmp, e))?;
+            fs::rename(&tmp, &path).map_err(|e| io(&path, e))?;
+            body
+        };
+        let days = parse_short_sale_daily(&body)?;
+        rows += days.len();
+        if days.len() < SHORT_SALE_PAGE_CAP {
+            break;
+        }
+        let Some(oldest) = days.first().map(|d| d.date).filter(|d| *d <= end) else {
+            break;
+        };
+        let Some(next) = oldest.pred_opt() else { break };
+        end = next;
+    }
+    Ok((requests, rows))
+}
+
+/// Every cached short-sale day for `code`, sorted, one per date.
+pub fn load_short_sale_daily(root: &Path, code: &str) -> Result<Vec<ShortSaleDay>, DataError> {
+    let dir = root.join(code);
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in read {
+        let path = item.map_err(|e| io(&dir, e))?.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            let text = fs::read_to_string(&path).map_err(|e| io(&path, e))?;
+            out.extend(parse_short_sale_daily(&text)?);
+        }
+    }
+    out.sort_by_key(|d| d.date);
+    out.dedup_by_key(|d| d.date);
+    Ok(out)
+}
+
 /// Every cached investor day for `code`, sorted, one per date.
 pub fn load_investor_daily(root: &Path, code: &str) -> Result<Vec<InvestorDay>, DataError> {
     let dir = root.join(code);
@@ -993,6 +1117,24 @@ mod tests {
         assert_eq!(days[0].institution_net_qty, 0.0);
         assert_eq!(days[1].foreign_net_value, -33681.0);
         assert_eq!(days[1].trading_value, 440_683_045_910.0);
+    }
+
+    #[test]
+    fn parses_daily_short_sale_pages_oldest_first() {
+        let body = r#"{"rt_cd":"0","msg_cd":"MCA00000","msg1":"ok","output1":{},"output2":[
+            {"stck_bsop_date":"20221229","ssts_cntg_qty":"54834","ssts_tr_pbmn":"3061797800","ssts_vol_rlim":"0.49","acml_vol":"11295935","acml_tr_pbmn":"628653753150"},
+            {"stck_bsop_date":"20221228","ssts_cntg_qty":"0","ssts_tr_pbmn":"","ssts_vol_rlim":"0.00","acml_vol":"0","acml_tr_pbmn":"0"}
+        ]}"#;
+        let days = parse_short_sale_daily(body).expect("parses");
+        assert_eq!(days.len(), 2);
+        assert_eq!(
+            days[0].date,
+            NaiveDate::from_ymd_opt(2022, 12, 28).expect("date")
+        );
+        assert_eq!(days[0].short_value, 0.0);
+        assert_eq!(days[1].short_qty, 54_834.0);
+        assert_eq!(days[1].short_value, 3_061_797_800.0);
+        assert_eq!(days[1].trading_value, 628_653_753_150.0);
     }
 
     #[test]

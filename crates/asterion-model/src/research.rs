@@ -222,6 +222,8 @@ pub enum Candidate {
     GbdtDart,
     // Trial 5 (README pre-registration): gbdt on base plus investor-flow columns.
     GbdtFlow,
+    // Trial 6 (README pre-registration): gbdt on base plus short-sale trading columns.
+    GbdtShort,
 }
 
 impl Candidate {
@@ -248,14 +250,19 @@ impl Candidate {
             Candidate::Gbdt => "gbdt",
             Candidate::GbdtDart => "gbdt_dart",
             Candidate::GbdtFlow => "gbdt_flow",
+            Candidate::GbdtShort => "gbdt_short",
         }
     }
 
-    /// Candidates a panel supports: `GbdtFlow` only when it carries flow columns.
+    /// Candidates a panel supports: `GbdtFlow` and `GbdtShort` only when the panel
+    /// carries their columns.
     pub fn for_panel(panel: &Panel) -> Vec<Candidate> {
         let mut out = Candidate::ALL.to_vec();
         if !flow_columns(panel).is_empty() {
             out.push(Candidate::GbdtFlow);
+        }
+        if !short_columns(panel).is_empty() {
+            out.push(Candidate::GbdtShort);
         }
         out
     }
@@ -271,11 +278,22 @@ pub fn flow_columns(panel: &Panel) -> Vec<usize> {
         .collect()
 }
 
-/// Columns before the first flow column (base plus title topics).
+/// Name prefix of the short-sale trading columns appended after the title-topic columns.
+pub const SHORT_PREFIX: &str = "shortsale_";
+
+/// Panel columns of the short-sale trading features.
+pub fn short_columns(panel: &Panel) -> Vec<usize> {
+    (0..panel.names.len())
+        .filter(|&j| panel.names[j].starts_with(SHORT_PREFIX))
+        .collect()
+}
+
+/// Columns before the first flow or short-sale column (base plus title topics).
 fn pre_flow_width(panel: &Panel) -> usize {
     flow_columns(panel)
-        .first()
-        .copied()
+        .into_iter()
+        .chain(short_columns(panel))
+        .min()
         .unwrap_or(panel.names.len())
 }
 
@@ -324,8 +342,13 @@ pub fn fit(candidate: Candidate, panel: &Panel, train: &[usize], k: usize) -> Sc
             pre_flow_width(panel),
             &GbdtParams::default(),
         )),
-        Candidate::GbdtFlow => {
-            let cols: Vec<usize> = (0..p).chain(flow_columns(panel)).collect();
+        Candidate::GbdtFlow | Candidate::GbdtShort => {
+            let added = if candidate == Candidate::GbdtFlow {
+                flow_columns(panel)
+            } else {
+                short_columns(panel)
+            };
+            let cols: Vec<usize> = (0..p).chain(added).collect();
             Scorer::Trees(Gbdt::fit_columns(
                 panel,
                 train,
@@ -931,6 +954,8 @@ pub const MIN_INCREMENT_T: f64 = 2.4;
 pub const ADDENDUM_MIN_T: f64 = 2.5;
 // Pre-registered threshold for the fifth trial (investor flows vs gbdt).
 pub const FLOW_MIN_T: f64 = 2.6;
+// Pre-registered threshold for the sixth trial (short-sale trading vs gbdt).
+pub const SHORT_MIN_T: f64 = 2.7;
 
 struct Run {
     ics: Vec<(NaiveDate, f64)>,
@@ -1019,13 +1044,16 @@ pub fn run_cv(
                 });
             }
             dev.push(pooled);
-            // Addenda: the title-topic and flow trials are judged against gbdt.
-            if matches!(c, Candidate::GbdtDart | Candidate::GbdtFlow) {
+            // Addenda: the title-topic, flow and short-sale trials are judged against gbdt.
+            if matches!(
+                c,
+                Candidate::GbdtDart | Candidate::GbdtFlow | Candidate::GbdtShort
+            ) {
                 let vs = format!("{}_vs_gbdt", c.id());
-                let min_t = if *c == Candidate::GbdtFlow {
-                    FLOW_MIN_T
-                } else {
-                    ADDENDUM_MIN_T
+                let min_t = match c {
+                    Candidate::GbdtFlow => FLOW_MIN_T,
+                    Candidate::GbdtShort => SHORT_MIN_T,
+                    _ => ADDENDUM_MIN_T,
                 };
                 let gi = candidates
                     .iter()

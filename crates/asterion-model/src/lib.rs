@@ -12,6 +12,7 @@ pub mod disclosures;
 pub mod explain;
 pub mod features;
 pub mod flows;
+pub mod shorts;
 pub mod fundamentals;
 pub mod history;
 mod labels;

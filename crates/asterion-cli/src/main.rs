@@ -101,7 +101,7 @@ enum Command {
     #[command(
         about = "Run purged walk-forward cross-validation comparing ranking models by top-decile long-only net returns"
     )]
-    ResearchCv(ResearchCvArgs),
+    ResearchCv(Box<ResearchCvArgs>),
     #[command(
         about = "Fit four ranking arms on labelled history, freeze by fingerprint, and register paper hypothesis"
     )]
@@ -118,6 +118,10 @@ enum Command {
         about = "Probe KIS daily stock investor-trade quotes and print row counts, date range, and fields without caching"
     )]
     ProbeInvestorDaily(ProbeInvestorDailyArgs),
+    #[command(about = "Probe KIS daily short-sale trading data and print row counts, date range, and fields without caching")]
+    ProbeShortSale(ProbeShortSaleArgs),
+    #[command(about = "Fetch uncached per-stock daily short-sale trading (volume and value, not balances) from KIS API into raw cache (resumable)")]
+    FetchShortSaleHistory(FetchShortSaleHistoryArgs),
     #[command(
         about = "Fetch uncached per-stock daily investor flows (foreign, institution, individual) from KIS API into raw cache (resumable)"
     )]
@@ -295,6 +299,37 @@ struct FetchInvestorHistoryArgs {
 
     #[arg(long, default_value = kis::INVESTOR_DAILY_ROOT, help = "Directory for raw KIS per-stock daily investor flow responses")]
     root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct FetchShortSaleHistoryArgs {
+    #[command(flatten)]
+    universe: UniverseArgs,
+
+    #[arg(long, value_parser = parse_date, default_value = "2019-10-01", help = "Earliest session date to collect, inclusive (default adds pre-2020 warm-up)")]
+    from: NaiveDate,
+
+    #[arg(long, value_parser = parse_date, default_value = "2024-12-31", help = "Latest request date, inclusive (default covers walk-forward test folds)")]
+    to: NaiveDate,
+
+    #[arg(long, default_value = kis::SHORT_SALE_ROOT, help = "Cache directory for raw KIS per-stock daily short-sale trading responses")]
+    root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ProbeShortSaleArgs {
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Comma-separated 6-digit KRX short codes to probe"
+    )]
+    symbols: Vec<String>,
+
+    #[arg(long, value_parser = parse_date, help = "Earliest session date, inclusive (YYYY-MM-DD)")]
+    from: NaiveDate,
+
+    #[arg(long, value_parser = parse_date, help = "Latest session date, inclusive (YYYY-MM-DD)")]
+    to: NaiveDate,
 }
 
 #[derive(Debug, Args)]
@@ -482,6 +517,20 @@ struct ResearchCvArgs {
         help = "Directory of cached KIS per-stock daily investor flow responses (read only with --with-flows)"
     )]
     flow_root: PathBuf,
+
+    #[arg(
+        long,
+        conflicts_with_all = ["with_history", "with_flows"],
+        help = "Append 5/20-session short-sale trading share features (short-sale value over trading value, not balances) and add the gbdt_short arm against gbdt (incompatible with --with-history and --with-flows)"
+    )]
+    with_short_sale: bool,
+
+    #[arg(
+        long,
+        default_value = kis::SHORT_SALE_ROOT,
+        help = "Directory of cached KIS per-stock daily short-sale trading responses (read only with --with-short-sale)"
+    )]
+    short_sale_root: PathBuf,
 
     #[arg(
         long,
@@ -1016,6 +1065,12 @@ async fn main() -> ExitCode {
             finish(progress, result)
         }
         Command::ProbeInvestorDaily(args) => probe_investor_daily(args).await,
+        Command::ProbeShortSale(args) => probe_short_sale(args).await,
+        Command::FetchShortSaleHistory(args) => {
+            let mut progress = ProgressTracker::start(&dir, "fetch-short-sale-history");
+            let result = fetch_short_sale_history(args, &mut progress).await;
+            finish(progress, result)
+        }
         Command::FetchInvestorHistory(args) => {
             let mut progress = ProgressTracker::start(&dir, "fetch-investor-history");
             let result = fetch_investor_history(args, &mut progress).await;
@@ -1035,7 +1090,7 @@ async fn main() -> ExitCode {
         Command::RankScore(args) => rank_score(args),
         Command::ResearchCv(args) => {
             let mut progress = ProgressTracker::start(&dir, "research-cv");
-            let result = research_cv(args, &mut progress);
+            let result = research_cv(*args, &mut progress);
             finish(progress, result)
         }
         Command::FetchFinancials(args) => {
@@ -2037,18 +2092,32 @@ async fn fetch_dart_backfill(
 // KIS sector codes for the two broad boards, in the order (KOSPI, KOSDAQ).
 const KIS_INDEX_CODES: [&str; 2] = ["0001", "1001"];
 
-// One worker's share of fetch-investor-history: (requests, rows, failures).
+// Per-stock KIS daily series collected by the sharded history workers.
+#[derive(Debug, Clone, Copy)]
+enum KisDaily {
+    Investor,
+    ShortSale,
+}
+
+// One worker's share of a per-stock KIS history fetch: (requests, rows, failures).
 async fn investor_worker(
     client: &mut KisClient,
     symbols: &[&Symbol],
     root: &Path,
     from: NaiveDate,
     to: NaiveDate,
+    kind: KisDaily,
 ) -> Result<(usize, usize, u32), DataError> {
     let (mut requests, mut rows, mut failures) = (0usize, 0usize, 0u32);
     for symbol in symbols {
         let code = symbol.code();
-        match kis::collect_investor_daily(client, root, code, from, to).await {
+        let result = match kind {
+            KisDaily::Investor => kis::collect_investor_daily(client, root, code, from, to).await,
+            KisDaily::ShortSale => {
+                kis::collect_short_sale_daily(client, root, code, from, to).await
+            }
+        };
+        match result {
             Ok((r, n)) => {
                 requests += r;
                 rows += n;
@@ -2074,8 +2143,48 @@ async fn fetch_investor_history(
     args: FetchInvestorHistoryArgs,
     progress: &mut ProgressTracker,
 ) -> CliResult<ExitCode> {
-    let cache = RawCache::new(&args.universe.cache_dir);
-    let symbols = resolve_symbols(&args.universe, &cache)?;
+    let (summary, code) = fetch_kis_daily_history(
+        &args.universe,
+        &args.root,
+        args.from,
+        args.to,
+        KisDaily::Investor,
+        progress,
+    )
+    .await?;
+    println!("fetch_investor_history_done {summary}");
+    Ok(code)
+}
+
+async fn fetch_short_sale_history(
+    args: FetchShortSaleHistoryArgs,
+    progress: &mut ProgressTracker,
+) -> CliResult<ExitCode> {
+    let (summary, code) = fetch_kis_daily_history(
+        &args.universe,
+        &args.root,
+        args.from,
+        args.to,
+        KisDaily::ShortSale,
+        progress,
+    )
+    .await?;
+    println!("fetch_short_sale_history_done {summary}");
+    Ok(code)
+}
+
+// Shards the universe over workers sharing one token; returns the summary fields and
+// the exit code (failure when any code failed).
+async fn fetch_kis_daily_history(
+    universe: &UniverseArgs,
+    root: &Path,
+    from: NaiveDate,
+    to: NaiveDate,
+    kind: KisDaily,
+    progress: &mut ProgressTracker,
+) -> CliResult<(String, ExitCode)> {
+    let cache = RawCache::new(&universe.cache_dir);
+    let symbols = resolve_symbols(universe, &cache)?;
     let policy = RetryPolicy {
         // Each worker waits the account-wide interval times the worker count.
         min_interval: kis::MIN_INTERVAL * INVESTOR_WORKERS as u32,
@@ -2095,9 +2204,9 @@ async fn fetch_investor_history(
     let (s0, s1, s2) = (shard(0), shard(1), shard(2));
     progress.stage("fetching", symbols.len() as u64);
     let (a, b, c) = tokio::join!(
-        investor_worker(&mut c0, &s0, &args.root, args.from, args.to),
-        investor_worker(&mut c1, &s1, &args.root, args.from, args.to),
-        investor_worker(&mut c2, &s2, &args.root, args.from, args.to),
+        investor_worker(&mut c0, &s0, root, from, to, kind),
+        investor_worker(&mut c1, &s1, root, from, to, kind),
+        investor_worker(&mut c2, &s2, root, from, to, kind),
     );
     let (mut requests, mut rows, mut failures) = (0usize, 0usize, 0u32);
     for r in [a, b, c] {
@@ -2107,12 +2216,15 @@ async fn fetch_investor_history(
         failures += f;
     }
     progress.advance(symbols.len() as u64);
-    println!("fetch_investor_history_done requests={requests} rows={rows} failures={failures}");
-    Ok(if failures == 0 {
+    let code = if failures == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
-    })
+    };
+    Ok((
+        format!("requests={requests} rows={rows} failures={failures}"),
+        code,
+    ))
 }
 
 // Read-only: prints the shape of investor-daily responses; nothing is cached.
@@ -2154,6 +2266,59 @@ async fn probe_investor_daily(args: ProbeInvestorDailyArgs) -> CliResult<ExitCod
                 }
                 Err(e) => println!("probe code={code} date={date} error={e}"),
             }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// Read-only: prints the shape of short-sale responses; nothing is cached.
+async fn probe_short_sale(args: ProbeShortSaleArgs) -> CliResult<ExitCode> {
+    let policy = RetryPolicy {
+        min_interval: kis::MIN_INTERVAL,
+        ..RetryPolicy::default()
+    };
+    let mut client = KisClient::new(KisKeys::from_env()?, kis::BASE_URL, policy)?;
+    for code in &args.symbols {
+        match client.fetch_short_sale_daily(code, args.from, args.to).await {
+            Ok(body) => {
+                let v: serde_json::Value = serde_json::from_str(&body)?;
+                let rows = v["output2"].as_array().cloned().unwrap_or_default();
+                let dates: Vec<&str> = rows
+                    .iter()
+                    .filter_map(|r| r["stck_bsop_date"].as_str())
+                    .collect();
+                let nonzero = rows
+                    .iter()
+                    .filter(|r| {
+                        r["ssts_cntg_qty"]
+                            .as_str()
+                            .and_then(|x| x.trim().parse::<f64>().ok())
+                            .is_some_and(|x| x > 0.0)
+                    })
+                    .count();
+                let first = rows.first().and_then(|r| r.as_object());
+                let keys: Vec<&String> = first.map(|o| o.keys().collect()).unwrap_or_default();
+                let sample = |k: &str| first.and_then(|o| o.get(k)).cloned();
+                println!(
+                    "probe code={code} from={} to={} rows={} nonzero_short={nonzero} newest={:?} oldest={:?} ssts_cntg_qty={:?} ssts_vol_rlim={:?} ssts_tr_pbmn={:?} ssts_tr_pbmn_rlim={:?} acml_vol={:?} acml_tr_pbmn={:?} keys={}",
+                    args.from,
+                    args.to,
+                    rows.len(),
+                    dates.first(),
+                    dates.last(),
+                    sample("ssts_cntg_qty"),
+                    sample("ssts_vol_rlim"),
+                    sample("ssts_tr_pbmn"),
+                    sample("ssts_tr_pbmn_rlim"),
+                    sample("acml_vol"),
+                    sample("acml_tr_pbmn"),
+                    keys.iter()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                );
+            }
+            Err(e) => println!("probe code={code} error={e}"),
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -2457,6 +2622,76 @@ fn load_delisted(
 // Flow coverage is checked from this date (the first data.go.kr year).
 const FLOW_COVERAGE_FROM: (i32, u32, u32) = (2020, 2, 1);
 
+// Pre-registered coverage window end for the short-sale trial (collection window end).
+const SHORT_COVERAGE_TO: (i32, u32, u32) = (2024, 12, 31);
+
+// Liquid-row share in [from, to] that `covers` accepts, overall and for names whose bars
+// stop before the data end: (rows, covered, stopped rows, stopped covered).
+fn coverage_counts(
+    samples: &[asterion_model::features::Sample],
+    from: NaiveDate,
+    to: NaiveDate,
+    covers: &dyn Fn(&str, NaiveDate) -> bool,
+) -> CliResult<(usize, usize, usize, usize)> {
+    let data_end = samples
+        .iter()
+        .map(|s| s.target_end)
+        .max()
+        .ok_or("no samples")?;
+    let cutoff = data_end
+        .checked_sub_days(chrono::Days::new(STOPPED_SLACK_DAYS))
+        .ok_or("invalid cutoff")?;
+    let mut last: BTreeMap<&str, NaiveDate> = BTreeMap::new();
+    for s in samples {
+        let e = last.entry(s.symbol.as_str()).or_insert(s.date);
+        *e = (*e).max(s.target_end);
+    }
+    let (mut n, mut hit, mut sn, mut shit) = (0usize, 0usize, 0usize, 0usize);
+    for s in samples
+        .iter()
+        .filter(|s| s.date >= from && s.date <= to && asterion_model::confidence::liquid(s))
+    {
+        let covered = usize::from(covers(&s.symbol, s.date));
+        n += 1;
+        hit += covered;
+        if last.get(s.symbol.as_str()).is_some_and(|d| *d < cutoff) {
+            sn += 1;
+            shit += covered;
+        }
+    }
+    Ok((n, hit, sn, shit))
+}
+
+// Loads cached short-sale trading and prints liquid-row coverage over the pre-registered
+// window, overall and for names whose bars stop before the data end.
+fn load_short_sale(
+    root: &Path,
+    symbols: &[Symbol],
+    samples: &[asterion_model::features::Sample],
+) -> CliResult<asterion_model::shorts::ShortIndex> {
+    let mut index = asterion_model::shorts::ShortIndex::default();
+    for symbol in symbols {
+        let days = kis::load_short_sale_daily(root, symbol.code())?;
+        if !days.is_empty() {
+            index.insert(symbol.code(), &days);
+        }
+    }
+    let (y, m, d) = FLOW_COVERAGE_FROM;
+    let from = NaiveDate::from_ymd_opt(y, m, d).ok_or("invalid coverage date")?;
+    let (y, m, d) = SHORT_COVERAGE_TO;
+    let to = NaiveDate::from_ymd_opt(y, m, d).ok_or("invalid coverage date")?;
+    let (n, hit, sn, shit) =
+        coverage_counts(samples, from, to, &|code, date| index.covers(code, date))?;
+    let share = |a: usize, b: usize| a as f64 / b.max(1) as f64;
+    println!(
+        "short_sale codes={} liquid_rows_from={from} to={to} rows={n} covered={:.4} stopped_rows={sn} stopped_covered={:.4}",
+        index.len(),
+        share(hit, n),
+        share(shit, sn)
+    );
+    Ok(index)
+}
+
 // Loads cached investor flows and prints liquid-row coverage, overall and for names whose
 // bars stop before the data end (missing flows must not mark later delistings).
 fn load_flows(
@@ -2749,11 +2984,23 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
     if args.with_flows {
         extra_names.extend_from_slice(&asterion_model::flows::FLOW_FEATURE_NAMES);
     }
+    let shorts = if args.with_short_sale {
+        load_short_sale(&args.short_sale_root, &symbols, &samples)?
+    } else {
+        asterion_model::shorts::ShortIndex::default()
+    };
+    if args.with_short_sale {
+        extra_names.extend_from_slice(&asterion_model::shorts::SHORT_FEATURE_NAMES);
+    }
     let with_flows = args.with_flows;
+    let with_short_sale = args.with_short_sale;
     let extras = |code: &str, date: NaiveDate| {
         let mut v = context.disclosures.topic_features(code, date).to_vec();
         if with_flows {
             v.extend_from_slice(&flows.features(code, date));
+        }
+        if with_short_sale {
+            v.extend_from_slice(&shorts.features(code, date));
         }
         v
     };
