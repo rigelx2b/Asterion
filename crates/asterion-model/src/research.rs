@@ -226,6 +226,10 @@ pub enum Candidate {
     GbdtShort,
     // Trial 7 (README pre-registration): gbdt scores held through a rank buffer.
     GbdtBuffer,
+    // Trial 10 (README pre-registration): the same rule at pre-fixed wider or narrower bands.
+    GbdtBuffer15,
+    GbdtBuffer30,
+    GbdtBuffer50,
     // Trial 8 (README pre-registration): gbdt on base plus stock-lending columns.
     GbdtLending,
 }
@@ -256,6 +260,9 @@ impl Candidate {
             Candidate::GbdtFlow => "gbdt_flow",
             Candidate::GbdtShort => "gbdt_short",
             Candidate::GbdtBuffer => "gbdt_buffer",
+            Candidate::GbdtBuffer15 => "gbdt_buffer15",
+            Candidate::GbdtBuffer30 => "gbdt_buffer30",
+            Candidate::GbdtBuffer50 => "gbdt_buffer50",
             Candidate::GbdtLending => "gbdt_lending",
         }
     }
@@ -282,7 +289,25 @@ impl Candidate {
         if opts.holding_buffer {
             out.push(Candidate::GbdtBuffer);
         }
+        if opts.buffer_sweep {
+            out.extend([
+                Candidate::GbdtBuffer15,
+                Candidate::GbdtBuffer30,
+                Candidate::GbdtBuffer50,
+            ]);
+        }
         out
+    }
+
+    /// Rank band of the holding-buffer arms; `None` for plain top-decile arms.
+    pub fn buffer_band(self) -> Option<f64> {
+        match self {
+            Candidate::GbdtBuffer => Some(BUFFER_BAND),
+            Candidate::GbdtBuffer15 => Some(0.15),
+            Candidate::GbdtBuffer30 => Some(0.30),
+            Candidate::GbdtBuffer50 => Some(0.50),
+            _ => None,
+        }
     }
 }
 
@@ -291,6 +316,8 @@ impl Candidate {
 pub struct CvOptions {
     /// Adds `gbdt_buffer`: gbdt scores with holdings kept while inside `BUFFER_BAND`.
     pub holding_buffer: bool,
+    /// Adds `gbdt_buffer15/30/50`: the same rule at the bands fixed by the tenth trial.
+    pub buffer_sweep: bool,
 }
 
 /// Name prefix of the investor-flow columns appended after the title-topic columns.
@@ -371,7 +398,11 @@ pub fn fit(candidate: Candidate, panel: &Panel, train: &[usize], k: usize) -> Sc
         Candidate::Composite6 => fixed(&COMPOSITE),
         Candidate::Ridge => fit_ridge(panel, train, k, p),
         // The buffer arm changes only portfolio construction, so it scores like gbdt.
-        Candidate::Gbdt | Candidate::GbdtBuffer => {
+        Candidate::Gbdt
+        | Candidate::GbdtBuffer
+        | Candidate::GbdtBuffer15
+        | Candidate::GbdtBuffer30
+        | Candidate::GbdtBuffer50 => {
             Scorer::Trees(Gbdt::fit(panel, train, k, p, &GbdtParams::default()))
         }
         Candidate::GbdtDart => Scorer::Trees(Gbdt::fit(
@@ -1103,6 +1134,9 @@ pub const FLOW_MIN_T: f64 = 2.6;
 pub const SHORT_MIN_T: f64 = 2.7;
 // Pre-registered threshold for the seventh trial (holding buffer vs gbdt).
 pub const BUFFER_MIN_T: f64 = 2.8;
+// Pre-registered per-band threshold for the tenth trial (three bands vs gbdt): base 3.1,
+// Bonferroni over three one-sided tests, t distribution with 32 degrees of freedom.
+pub const BUFFER_SWEEP_MIN_T: f64 = 3.78;
 // Pre-registered threshold for the eighth trial (stock lending vs gbdt).
 pub const LENDING_MIN_T: f64 = 2.9;
 
@@ -1123,8 +1157,8 @@ fn run_fold(
     let mut gbdt_scores: Option<Vec<f64>> = None;
     let mut runs = Vec::new();
     for c in Candidate::for_run(panel, opts) {
-        // The buffer arm reuses this fold's gbdt scores instead of refitting.
-        let reused = if c == Candidate::GbdtBuffer {
+        // Buffer arms reuse this fold's gbdt scores instead of refitting.
+        let reused = if c.buffer_band().is_some() {
             gbdt_scores.clone()
         } else {
             None
@@ -1143,10 +1177,9 @@ fn run_fold(
                 .collect()
             }
         };
-        let (ics, records) = if c == Candidate::GbdtBuffer {
-            evaluate_buffered(panel, &test, &scores, k, BUFFER_BAND)
-        } else {
-            evaluate(panel, &test, &scores, k, false)
+        let (ics, records) = match c.buffer_band() {
+            Some(band) => evaluate_buffered(panel, &test, &scores, k, band),
+            None => evaluate(panel, &test, &scores, k, false),
         };
         if c == Candidate::Gbdt {
             gbdt_scores = Some(scores);
@@ -1236,6 +1269,9 @@ pub fn run_cv_with(
                     | Candidate::GbdtFlow
                     | Candidate::GbdtShort
                     | Candidate::GbdtBuffer
+                    | Candidate::GbdtBuffer15
+                    | Candidate::GbdtBuffer30
+                    | Candidate::GbdtBuffer50
                     | Candidate::GbdtLending
             ) {
                 let vs = format!("{}_vs_gbdt", c.id());
@@ -1243,6 +1279,9 @@ pub fn run_cv_with(
                     Candidate::GbdtFlow => FLOW_MIN_T,
                     Candidate::GbdtShort => SHORT_MIN_T,
                     Candidate::GbdtBuffer => BUFFER_MIN_T,
+                    Candidate::GbdtBuffer15 | Candidate::GbdtBuffer30 | Candidate::GbdtBuffer50 => {
+                        BUFFER_SWEEP_MIN_T
+                    }
                     Candidate::GbdtLending => LENDING_MIN_T,
                     _ => ADDENDUM_MIN_T,
                 };
@@ -1497,6 +1536,27 @@ mod tests {
             assert!((a.bench_net - b.bench_net).abs() < 1e-12);
             assert!((a.turnover - b.turnover).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn buffer_sweep_adds_three_banded_arms_that_reuse_gbdt_scoring() {
+        let (panel, _, _) = buffer_fixture();
+        let plain = Candidate::for_run(&panel, CvOptions::default());
+        let sweep = Candidate::for_run(
+            &panel,
+            CvOptions {
+                buffer_sweep: true,
+                ..CvOptions::default()
+            },
+        );
+        assert_eq!(sweep.len(), plain.len() + 3);
+        let bands: Vec<Option<f64>> = sweep[plain.len()..]
+            .iter()
+            .map(|c| c.buffer_band())
+            .collect();
+        assert_eq!(bands, vec![Some(0.15), Some(0.30), Some(0.50)]);
+        assert_eq!(Candidate::Gbdt.buffer_band(), None);
+        assert_eq!(Candidate::GbdtBuffer.buffer_band(), Some(BUFFER_BAND));
     }
 
     #[test]

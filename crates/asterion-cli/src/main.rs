@@ -603,6 +603,12 @@ struct ResearchCvArgs {
 
     #[arg(
         long,
+        help = "Add the gbdt_buffer15, gbdt_buffer30, and gbdt_buffer50 arms against gbdt (portfolio construction only: keep prior holdings within the top 15%, 30%, or 50% gbdt score rank and fill remaining top-decile slots by score)"
+    )]
+    buffer_sweep: bool,
+
+    #[arg(
+        long,
         default_value = "data/ledger/cv_2026-11-13/report.json",
         help = "Output path for the JSON cross-validation report"
     )]
@@ -3271,6 +3277,7 @@ fn research_cv(args: ResearchCvArgs, progress: &mut ProgressTracker) -> CliResul
     progress.stage("cross-validation", 0);
     let opts = CvOptions {
         holding_buffer: args.holding_buffer,
+        buffer_sweep: args.buffer_sweep,
     };
     let report = run_cv_with(&panel, &folds, burnt, args.embargo_days, opts, &|line| {
         println!("{line}")
